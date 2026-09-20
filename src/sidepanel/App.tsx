@@ -1,0 +1,1397 @@
+import { useState, useEffect, useCallback } from 'react';
+import { 
+  FolderKanban, Sparkles, Download, FileText, Video, Camera,
+  Bot, Settings, CheckCircle2, AlertCircle, RefreshCw, 
+  Plus, Tag, Bookmark, Layers, HardDrive, Terminal,
+  Eye, EyeOff, Search, Compass
+} from 'lucide-react';
+import { set as setIdb } from 'idb-keyval';
+import { PluginSettings, DEFAULT_SETTINGS, ProjectConfig, CapturedItem } from '@/types';
+import { getSettings, saveSettings, updateProject } from '@/lib/storage/settings';
+import { pickWorkspaceDirectory, getWorkspaceDirectoryHandle, ensureSensorDirectoryOnHandle } from '@/lib/storage/fsAccess';
+import { checkBridgeHealth, fetchSystemEnvFromBridge, initSensorWorkspaceViaBridge } from '@/lib/storage/bridgeClient';
+import { getRecentCaptures, executeSaveBundle } from '@/lib/storage/bundleSaver';
+import { fetchAvailableModels } from '@/lib/ai/deepseek';
+import { trackEvent, fetchTelemetryInsights, discoverProjectsInDirectory } from '@/lib/telemetry/tracker';
+
+export default function App() {
+  const [settings, setSettings] = useState<PluginSettings>(DEFAULT_SETTINGS);
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [availableModels, setAvailableModels] = useState<string[]>([
+    'deepseek-flash',
+    'deepseek flash',
+    'deepseek-v4-pro',
+    'deepseek-chat',
+    'deepseek-reasoner'
+  ]);
+  const [isRefreshingModels, setIsRefreshingModels] = useState(false);
+  const [activeTab, setActiveTab] = useState<{ id?: number; title?: string; url?: string }>({});
+  const [bridgeOnline, setBridgeOnline] = useState<boolean | null>(null);
+  const [fsHandleActive, setFsHandleActive] = useState<boolean>(false);
+  const [fsDirName, setFsDirName] = useState<string>('');
+  const [recentItems, setRecentItems] = useState<CapturedItem[]>([]);
+  const [currentView, setCurrentView] = useState<'workbench' | 'projects' | 'settings'>('workbench');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isLaunchingBridge, setIsLaunchingBridge] = useState(false);
+  const [toastMsg, setToastMsg] = useState<{ text: string; isError?: boolean } | null>(null);
+
+  // 快速便签状态
+  const [quickNote, setQuickNote] = useState('');
+  const [customTopicInput, setCustomTopicInput] = useState('');
+  const [showAddTopic, setShowAddTopic] = useState(false);
+
+  // 新建项目状态与选定目录句柄
+  const [newProjName, setNewProjName] = useState('');
+  const [newProjPath, setNewProjPath] = useState('');
+  const [newProjTopics, setNewProjTopics] = useState('General, Architecture, Notes');
+  const [tempDirHandle, setTempDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
+
+  // 行为埋点与洞察推荐
+  const [suggestedTopics, setSuggestedTopics] = useState<string[]>([]);
+  const [frequentParentDirs, setFrequentParentDirs] = useState<string[]>([]);
+  const [discoveredProjects, setDiscoveredProjects] = useState<{ path: string; name: string; hasDshSensor: boolean }[]>([]);
+  const [parentScanDir, setParentScanDir] = useState<string>('');
+  const [isScanning, setIsScanning] = useState<boolean>(false);
+
+  const showToast = (text: string, isError = false) => {
+    setToastMsg({ text, isError });
+    setTimeout(() => setToastMsg(null), 3500);
+  };
+
+  const loadData = useCallback(async () => {
+    const s = await getSettings();
+    setSettings(s);
+
+    // 检查桥接服务心跳
+    const health = await checkBridgeHealth(s.bridgeUrl);
+    const isBridgeUp = !!health && health.status === 'ok';
+    setBridgeOnline(isBridgeUp);
+
+    const currentProject = s.projects.find(p => p.id === s.activeProjectId) || s.projects[0];
+
+    // 检查当前项目的 File System Handle (支持继承与 /dshWebSensor 自动创建)
+    const handle = await getWorkspaceDirectoryHandle(s.activeProjectId, currentProject?.name);
+    if (handle) {
+      setFsHandleActive(true);
+      setFsDirName(handle.name);
+    } else {
+      setFsHandleActive(false);
+      setFsDirName('');
+    }
+
+    // 若 Bridge 在线，同时确保当前项目的 /dshWebSensor 子目录在物理磁盘就绪
+    if (isBridgeUp && currentProject?.workspacePath) {
+      initSensorWorkspaceViaBridge(s.bridgeUrl, currentProject.workspacePath, currentProject.name).catch(() => {});
+    }
+
+    // 加载历史
+    const history = await getRecentCaptures();
+    setRecentItems(history);
+  }, []);
+
+  useEffect(() => {
+    loadData();
+
+    // 获取当前标签页信息
+    if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query) {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs[0]) {
+          const tab = tabs[0];
+          setActiveTab({
+            id: tab.id,
+            title: tab.title,
+            url: tab.url,
+          });
+
+          // 根据当前访问页面的 domain 获取智能主题推荐
+          if (tab.url) {
+            try {
+              const domain = new URL(tab.url).hostname;
+              fetchTelemetryInsights(domain).then(insights => {
+                if (insights) {
+                  if (insights.suggestedTopicsForCurrentDomain) {
+                    setSuggestedTopics(insights.suggestedTopicsForCurrentDomain);
+                  }
+                  if (insights.frequentParentDirs && insights.frequentParentDirs.length > 0) {
+                    setFrequentParentDirs(insights.frequentParentDirs);
+                    setParentScanDir(prev => prev || insights.frequentParentDirs[0]);
+                  }
+                }
+              });
+
+              // 页面行为埋点
+              trackEvent({
+                eventType: 'page_view',
+                projectId: settings.activeProjectId,
+                url: tab.url,
+                domain,
+                pageTitle: tab.title,
+              }).catch(() => {});
+            } catch {}
+          }
+        }
+      });
+    }
+
+    // 监听实时线索落盘通知（如截图快照完成或抓取保存）
+    if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
+      const handleRuntimeMsg = (msg: any) => {
+        if (msg.type === 'ITEM_SAVED_EVENT') {
+          loadData();
+          if (msg.payload?.title) {
+            showToast(`✓ 已自动同步新线索: ${msg.payload.title.slice(0, 20)}`);
+          }
+        }
+      };
+      chrome.runtime.onMessage.addListener(handleRuntimeMsg);
+      return () => chrome.runtime.onMessage.removeListener(handleRuntimeMsg);
+    }
+  }, [loadData]);
+
+  const activeProject = settings.projects.find(p => p.id === settings.activeProjectId) || settings.projects[0];
+
+  // 切换项目
+  const activeTopics = (settings.activeTopics && settings.activeTopics.length > 0)
+    ? settings.activeTopics
+    : [settings.activeTopic || 'General'];
+
+  // 切换项目（并自动切换/继承授权目录，且确保 /dshWebSensor 子目录就绪）
+  const handleSwitchProject = async (projId: string) => {
+    const target = settings.projects.find(p => p.id === projId);
+    if (!target) return;
+
+    const targetTopics = target.topics || ['General'];
+    const validTopics = activeTopics.filter(t => targetTopics.includes(t));
+    const newActiveTopics = validTopics.length > 0 ? validTopics : [targetTopics[0]];
+
+    const updated = await saveSettings({ 
+      activeProjectId: projId,
+      activeTopics: newActiveTopics,
+      activeTopic: newActiveTopics[0]
+    });
+    setSettings(updated);
+
+    // 1. 自动切换/继承并就绪当前项目的 File System 句柄及 /dshWebSensor 子目录
+    const handle = await getWorkspaceDirectoryHandle(projId, target.name);
+    if (handle) {
+      setFsHandleActive(true);
+      setFsDirName(handle.name);
+    } else {
+      setFsHandleActive(false);
+      setFsDirName('');
+    }
+
+    // 2. 若 Bridge 在线，立即向 Bridge 发送指令初始化物理 /dshWebSensor 子目录
+    if (bridgeOnline && target.workspacePath) {
+      initSensorWorkspaceViaBridge(settings.bridgeUrl, target.workspacePath, target.name).catch(() => {});
+    }
+
+    const displayTarget = handle ? `${handle.name}/dshWebSensor` : (target.workspacePath ? `${target.workspacePath}/dshWebSensor` : 'dshWebSensor');
+    showToast(`✓ 已自动切换至【${target.name}】，落盘空间: ${displayTarget} 已就绪`);
+
+    trackEvent({
+      eventType: 'switch_project',
+      projectId: projId,
+      projectName: target.name,
+      metadata: { 
+        workspacePath: target.workspacePath, 
+        activeTopics: newActiveTopics,
+        sensorPath: `${target.workspacePath}/dshWebSensor`
+      },
+    }).catch(() => {});
+  };
+
+  // 切换主题多选状态 (Toggle)
+  const handleToggleTopic = async (topic: string) => {
+    let updatedTopics: string[];
+    if (activeTopics.includes(topic)) {
+      if (activeTopics.length <= 1) {
+        showToast('至少需保留一个选中的研究主题');
+        return;
+      }
+      updatedTopics = activeTopics.filter(t => t !== topic);
+    } else {
+      updatedTopics = [...activeTopics, topic];
+    }
+
+    const updated = await saveSettings({ 
+      activeTopics: updatedTopics, 
+      activeTopic: updatedTopics[0] 
+    });
+    setSettings(updated);
+
+    trackEvent({
+      eventType: 'switch_topic',
+      projectId: activeProject.id,
+      projectName: activeProject.name,
+      topic: updatedTopics.join('+'),
+      metadata: { activeTopics: updatedTopics },
+    }).catch(() => {});
+  };
+
+  // 全选当前项目的所有主题
+  const handleSelectAllTopics = async () => {
+    const allTopics = activeProject.topics || ['General'];
+    const updated = await saveSettings({
+      activeTopics: allTopics,
+      activeTopic: allTopics[0],
+    });
+    setSettings(updated);
+    showToast(`已全选当前项目 ${allTopics.length} 个主题`);
+  };
+
+  // 添加推荐主题并加入多选
+  const handleAddSuggestedTopic = async (st: string) => {
+    if (!activeProject.topics.includes(st)) {
+      const newTopics = [...activeProject.topics, st];
+      await updateProject(activeProject.id, { topics: newTopics });
+    }
+    if (!activeTopics.includes(st)) {
+      const updatedActiveTopics = [...activeTopics, st];
+      const updated = await saveSettings({
+        activeTopics: updatedActiveTopics,
+        activeTopic: updatedActiveTopics[0],
+      });
+      setSettings(updated);
+      showToast(`已将【${st}】加入多选研究主题`);
+    } else {
+      showToast(`【${st}】已在已选主题中`);
+    }
+  };
+
+  const handleAddTopicConfirm = async () => {
+    if (!customTopicInput.trim()) return;
+    const name = customTopicInput.trim();
+    const currentTopics = activeProject.topics || [];
+    if (!currentTopics.includes(name)) {
+      const newTopics = [...currentTopics, name];
+      await updateProject(activeProject.id, { topics: newTopics });
+    }
+    const updatedActiveTopics = activeTopics.includes(name) ? activeTopics : [...activeTopics, name];
+    const updated = await saveSettings({ 
+      activeTopics: updatedActiveTopics, 
+      activeTopic: updatedActiveTopics[0] 
+    });
+    setSettings(updated);
+    setCustomTopicInput('');
+    setShowAddTopic(false);
+    showToast(`主题【${name}】已创建并选中`);
+  };
+
+  // 授权本地文件夹并就绪 /dshWebSensor 子目录
+  const handleAuthorizeFolder = async () => {
+    try {
+      const res = await pickWorkspaceDirectory(activeProject.id);
+      setFsHandleActive(true);
+      setFsDirName(res.name);
+      await updateProject(activeProject.id, { workspacePath: res.name });
+      showToast(`已授权本地目录，落盘空间: ${res.name}/dshWebSensor 已就绪`);
+      loadData();
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        showToast(`授权失败: ${(err as Error).message}`, true);
+      }
+    }
+  };
+
+  // 一键调起本地 Bridge 伴侣服务（开启 100% 免授权直写）
+  const handleLaunchBridge = async () => {
+    setIsLaunchingBridge(true);
+    showToast('正在调起本地 DSH Bridge 伴侣服务...');
+
+    try {
+      const a = document.createElement('a');
+      a.href = 'dshbridge://start';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch {
+      window.location.href = 'dshbridge://start';
+    }
+
+    let attempts = 0;
+    const timer = setInterval(async () => {
+      attempts++;
+      const health = await checkBridgeHealth(settings.bridgeUrl);
+      if (health && health.status === 'ok') {
+        clearInterval(timer);
+        setBridgeOnline(true);
+        setIsLaunchingBridge(false);
+        showToast('🎉 DSH 本地 Bridge 伴侣已成功启动！已进入 100% 免授权直写模式！');
+        loadData();
+      } else if (attempts >= 10) {
+        clearInterval(timer);
+        setIsLaunchingBridge(false);
+        showToast('⚠️ 未检测到服务响应，若首次使用可双击运行根目录 start_bridge.bat', true);
+      }
+    }, 600);
+  };
+
+  // 1-Click 抓取网页正文
+  const handleCaptureCurrentPage = async () => {
+    if (!activeTab.id) {
+      showToast('未检测到活跃标签页', true);
+      return;
+    }
+    setIsProcessing(true);
+    chrome.tabs.sendMessage(activeTab.id, { type: 'CAPTURE_FULL_PAGE' }, (response) => {
+      setIsProcessing(false);
+      if (response && response.success) {
+        showToast('正文抓取成功并已开始落盘！');
+        loadData();
+      } else {
+        showToast(`抓取遇到问题: ${response?.error || '页面可能未完全加载'}`, true);
+      }
+    });
+  };
+
+  // 1-Click 归档 AI 对话会话
+  const handleCaptureChatSession = async () => {
+    if (!activeTab.id) {
+      showToast('未检测到活跃标签页', true);
+      return;
+    }
+    setIsProcessing(true);
+    chrome.tabs.sendMessage(activeTab.id, { type: 'CAPTURE_CHAT_SESSION' }, (response) => {
+      setIsProcessing(false);
+      if (response && response.success) {
+        showToast('整场 AI 对话已成功归档！');
+        loadData();
+      } else {
+        showToast(`会话归档失败: ${response?.error || '请确认当前页面为支持的 AI Chat 平台'}`, true);
+      }
+    });
+  };
+
+  // 1-Click 抓取视频时间戳线索
+  const handleCaptureVideo = async () => {
+    if (!activeTab.id) {
+      showToast('未检测到活跃标签页', true);
+      return;
+    }
+    setIsProcessing(true);
+    chrome.tabs.sendMessage(activeTab.id, { type: 'CAPTURE_VIDEO_CUE' as any }, (response) => {
+      setIsProcessing(false);
+      if (response && response.success) {
+        showToast('视频时间轴线索已成功落盘！');
+        loadData();
+      } else {
+        showToast(`视频抓取失败: ${response?.error || '当前页面未检测到视频'}`, true);
+      }
+    });
+  };
+
+  // 1-Click 网页区域截图快照与视觉数据标注
+  const handleCaptureScreenshot = async () => {
+    if (!activeTab.id) {
+      showToast('未检测到活跃标签页', true);
+      return;
+    }
+    chrome.tabs.sendMessage(activeTab.id, { type: 'START_SCREENSHOT_CAPTURE' }, () => {
+      if (chrome.runtime.lastError) {
+        showToast('唤起截图失败，请刷新目标页面重试', true);
+      }
+    });
+  };
+
+  // 快速提交便签/灵感
+  const handleSaveQuickNote = async () => {
+    if (!quickNote.trim()) return;
+    setIsProcessing(true);
+    const item: CapturedItem = {
+      id: `note-${Date.now()}`,
+      project: activeProject.name,
+      topic: activeTopics.join('+'),
+      topics: activeTopics,
+      title: `调研便签: ${quickNote.slice(0, 20)}...`,
+      url: activeTab.url || 'local://quick-note',
+      sourcePlatform: 'other',
+      capturedAt: new Date().toISOString(),
+      documentType: 'note',
+      tags: ['QuickNote', 'Idea', ...activeTopics],
+      markdownContent: `### 📝 快速调研备忘便签\n\n${quickNote}\n\n---\n> 🏷️ **归属主题**: ${activeTopics.join('、')}\n> ⏰ 记录时刻: ${new Date().toLocaleString()}\n> 关联页面: [${activeTab.title || '无'}](${activeTab.url || '#'})`,
+      mediaAttachments: [],
+    };
+
+    try {
+      await executeSaveBundle(item);
+      setQuickNote('');
+      showToast('灵感便签已成功落盘');
+      loadData();
+    } catch (e) {
+      showToast(`保存失败: ${(e as Error).message}`, true);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // 浏览原生目录并自动建议与物理创建 /dshWebSensor
+  const handleBrowseNewProjectFolder = async () => {
+    try {
+      if (!('showDirectoryPicker' in window)) {
+        showToast('当前浏览器不支持文件夹选取 API，请手动输入路径', true);
+        return;
+      }
+      const handle = await (window as unknown as { showDirectoryPicker: (options?: { mode?: string }) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker({
+        mode: 'readwrite',
+      });
+      if (handle) {
+        // 立即物理创建/确保 dshWebSensor 子目录存在
+        await ensureSensorDirectoryOnHandle(handle).catch(() => {});
+        setTempDirHandle(handle);
+        setNewProjPath(handle.name);
+        if (!newProjName.trim()) {
+          setNewProjName(handle.name);
+        }
+        showToast(`已选取目录并自动建议/就绪: ${handle.name}/dshWebSensor`);
+      }
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        showToast(`选择目录失败: ${(err as Error).message}`, true);
+      }
+    }
+  };
+
+  // 创建新项目
+  const handleCreateProject = async () => {
+    if (!newProjName.trim()) {
+      showToast('请输入项目名称', true);
+      return;
+    }
+    const topicsArr = newProjTopics.split(/[,，]/).map(t => t.trim()).filter(Boolean);
+    const chosenWorkspace = newProjPath.trim() || (parentScanDir ? `${parentScanDir}/${newProjName.trim()}` : `D:/KnowledgeBase/${newProjName.trim()}`);
+    
+    const newP: ProjectConfig = {
+      id: `proj-${Date.now()}`,
+      name: newProjName.trim(),
+      description: '用户自定义项目空间',
+      topics: topicsArr.length ? topicsArr : ['General'],
+      workspacePath: chosenWorkspace,
+      storageMode: tempDirHandle ? 'fs_access' : 'local_bridge',
+      createdAt: new Date().toISOString(),
+    };
+
+    // 如果通过浏览器浏览选取了目录句柄，直接持久化绑定权限并缓存
+    if (tempDirHandle) {
+      await ensureSensorDirectoryOnHandle(tempDirHandle).catch(() => {});
+      await setIdb(`dsh_fs_dir_handle_${newP.id}`, tempDirHandle);
+      await setIdb(`dsh_fs_dir_handle_latest`, tempDirHandle);
+      setFsHandleActive(true);
+      setFsDirName(tempDirHandle.name);
+    }
+
+    // 若 Bridge 在线，立即物理创建项目文件夹及 /dshWebSensor 子目录
+    if (bridgeOnline && newP.workspacePath) {
+      initSensorWorkspaceViaBridge(settings.bridgeUrl, newP.workspacePath, newP.name).catch(() => {});
+    }
+
+    const updatedProjects = [...settings.projects, newP];
+    const updated = await saveSettings({ 
+      projects: updatedProjects, 
+      activeProjectId: newP.id,
+      activeTopics: newP.topics,
+      activeTopic: newP.topics[0]
+    });
+    setSettings(updated);
+
+    // 记录行为埋点
+    trackEvent({
+      eventType: 'create_project',
+      projectId: newP.id,
+      projectName: newP.name,
+      metadata: { 
+        workspacePath: newP.workspacePath, 
+        topics: newP.topics,
+        sensorPath: `${newP.workspacePath}/dshWebSensor`
+      },
+    }).catch(() => {});
+
+    setNewProjName('');
+    setNewProjPath('');
+    setTempDirHandle(null);
+    setCurrentView('workbench');
+    showToast(`✓ 项目【${newP.name}】创建成功，已自动切换落盘空间至 /dshWebSensor`);
+  };
+
+  // 扫描常用大目录子工程
+  const handleScanParentDir = async () => {
+    if (!parentScanDir.trim()) {
+      showToast('请输入或选择常用大目录路径', true);
+      return;
+    }
+    setIsScanning(true);
+    try {
+      const projs = await discoverProjectsInDirectory(parentScanDir.trim());
+      setDiscoveredProjects(projs);
+      if (projs.length === 0) {
+        showToast('未在指定目录下发现子项目或 Bridge 服务未启动', true);
+      } else {
+        showToast(`成功扫描到 ${projs.length} 个子项目文件夹`);
+      }
+    } catch (e) {
+      showToast(`扫描异常: ${(e as Error).message}`, true);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  // 1-Click 导入扫描到的项目
+  const handleImportDiscoveredProject = async (p: { path: string; name: string; hasDshSensor: boolean }) => {
+    if (settings.projects.some(exist => exist.workspacePath === p.path || exist.name === p.name)) {
+      showToast(`项目【${p.name}】已在列表中`);
+      return;
+    }
+    const newP: ProjectConfig = {
+      id: `proj-${Date.now()}`,
+      name: p.name,
+      description: '从大目录扫描自动导入',
+      topics: ['General', 'Architecture', 'Notes'],
+      workspacePath: p.path,
+      storageMode: 'local_bridge',
+      createdAt: new Date().toISOString(),
+    };
+
+    // 若 Bridge 在线，确保目标项目的 /dshWebSensor 物理存在
+    if (bridgeOnline) {
+      initSensorWorkspaceViaBridge(settings.bridgeUrl, newP.workspacePath, newP.name).catch(() => {});
+    }
+
+    const updatedProjects = [...settings.projects, newP];
+    const updated = await saveSettings({ 
+      projects: updatedProjects, 
+      activeProjectId: newP.id,
+      activeTopics: newP.topics,
+      activeTopic: newP.topics[0]
+    });
+    setSettings(updated);
+
+    // 尝试获取或继承目录句柄
+    const handle = await getWorkspaceDirectoryHandle(newP.id, newP.name);
+    if (handle) {
+      setFsHandleActive(true);
+      setFsDirName(handle.name);
+    }
+
+    trackEvent({
+      eventType: 'create_project',
+      projectId: newP.id,
+      projectName: newP.name,
+      metadata: { workspacePath: newP.workspacePath, imported: true, sensorPath: `${newP.workspacePath}/dshWebSensor` },
+    }).catch(() => {});
+    showToast(`已导入并自动切换至【${newP.name}】，落盘目标 /dshWebSensor 已就绪`);
+  };
+
+  // 从 DeepSeek API 动态拉取模型列表
+  const handleRefreshModels = async () => {
+    if (!settings.deepseekApiKey) {
+      showToast('请先输入 DeepSeek API Key 再刷新模型', true);
+      return;
+    }
+    setIsRefreshingModels(true);
+    try {
+      const models = await fetchAvailableModels(settings.deepseekApiKey, settings.deepseekBaseUrl);
+      if (models.length > 0) {
+        setAvailableModels(models);
+        showToast(`已成功从 DeepSeek API 获取到 ${models.length} 个可用模型`);
+      } else {
+        showToast('获取模型列表失败，请检查 API Key 或网络', true);
+      }
+    } catch {
+      showToast('获取模型异常', true);
+    } finally {
+      setIsRefreshingModels(false);
+    }
+  };
+
+  // 通过本地伴侣 Bridge 同步系统环境变量中的 DEEPSEEK_API_KEY
+  const handleSyncEnvKey = async () => {
+    const envData = await fetchSystemEnvFromBridge(settings.bridgeUrl);
+    if (envData && envData.deepseek_api_key) {
+      setSettings({ ...settings, deepseekApiKey: envData.deepseek_api_key });
+      showToast('已从本地环境变量同步 DEEPSEEK_API_KEY');
+    } else {
+      showToast('未从本地服务读取到 DEEPSEEK_API_KEY，请确认 Bridge 服务已启动', true);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-slate-50 text-slate-800 text-xs select-none">
+      {/* 顶部 Header */}
+      <header className="flex items-center justify-between px-3 py-2.5 bg-slate-900 text-white border-b border-slate-800 shadow-sm">
+        <div className="flex items-center space-x-2">
+          <img src="/icons/icon48.png" className="w-5 h-5 rounded-full object-cover shadow-xs" alt="DSH Whale" />
+          <div>
+            <h1 className="font-semibold tracking-wide text-xs text-slate-100 flex items-center gap-1.5">
+              DSH Web Sensor
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono">v1.0</span>
+            </h1>
+          </div>
+        </div>
+
+        {/* 状态灯与导航 */}
+        <div className="flex items-center space-x-2">
+          {bridgeOnline ? (
+            <div 
+              title="DSH 本地 Bridge 守护进程已连通 (已开启 100% 免授权物理直写)"
+              className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 border border-emerald-500/40 text-[10px]"
+            >
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+              <span className="text-emerald-300 font-mono">⚡ Bridge(免授权)</span>
+            </div>
+          ) : (
+            <button 
+              onClick={handleLaunchBridge}
+              disabled={isLaunchingBridge}
+              title="点击一键唤起本地伴侣网关，开启完全免授权直写"
+              className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-rose-950/80 hover:bg-rose-900 border border-rose-600/60 text-[10px] text-rose-200 transition cursor-pointer"
+            >
+              <span className="w-2 h-2 rounded-full bg-rose-400"></span>
+              <span className="font-mono">{isLaunchingBridge ? '启动中...' : '一键启动Bridge'}</span>
+            </button>
+          )}
+
+          <button 
+            onClick={() => setCurrentView(v => v === 'workbench' ? 'settings' : 'workbench')}
+            className={`p-1.5 rounded transition ${currentView === 'settings' ? 'bg-slate-700 text-emerald-400' : 'hover:bg-slate-800 text-slate-300'}`}
+            title="配置中心"
+          >
+            <Settings className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </header>
+
+      {/* Toast 提示条 */}
+      {toastMsg && (
+        <div className={`mx-3 mt-2 p-2 rounded text-xs flex items-center gap-2 shadow transition-all ${toastMsg.isError ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-800 border border-emerald-200'}`}>
+          {toastMsg.isError ? <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" /> : <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0" />}
+          <span className="truncate flex-1">{toastMsg.text}</span>
+        </div>
+      )}
+
+      {/* 主视图切换 */}
+      {currentView === 'workbench' && (
+        <main className="flex-1 overflow-y-auto p-3 space-y-3">
+          {/* Bridge 离线提示与一键启动免授权卡片 */}
+          {!bridgeOnline && (
+            <div className="p-2.5 rounded-lg bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200/90 shadow-2xs space-y-1.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5 text-amber-900 font-medium text-xs">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
+                  </span>
+                  <span>本地 Bridge 伴侣服务未运行</span>
+                </div>
+                <span className="text-[9px] text-amber-700 font-mono bg-amber-100/90 px-1 py-0.2 rounded border border-amber-300/60">
+                  当前沙箱受限
+                </span>
+              </div>
+              <p className="text-[10px] text-amber-800 leading-relaxed">
+                不想每次点击授权？点击下方按钮一键调起后台伴侣网关，即可开启 <strong className="text-amber-950 font-semibold">100% 免授权全自动落盘</strong>！
+              </p>
+              <div className="flex items-center gap-2 pt-0.5">
+                <button
+                  onClick={handleLaunchBridge}
+                  disabled={isLaunchingBridge}
+                  className="flex-1 py-1.5 px-2.5 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white rounded font-medium text-xs shadow-xs transition flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  {isLaunchingBridge ? '正在调起本地网关...' : '🚀 一键运行 Bridge (开启免授权直写)'}
+                </button>
+              </div>
+            </div>
+          )}
+          {/* 项目与主题工作区卡片 */}
+          <div className="bg-white rounded-lg p-2.5 border border-slate-200 shadow-sm space-y-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-1.5 text-slate-700 font-medium">
+                <FolderKanban className="w-3.5 h-3.5 text-emerald-600" />
+                <span>活跃研究项目</span>
+              </div>
+              <button 
+                onClick={() => setCurrentView('projects')}
+                className="text-[11px] text-emerald-600 hover:text-emerald-700 flex items-center gap-0.5"
+              >
+                <Plus className="w-3 h-3" /> 新建/管理
+              </button>
+            </div>
+
+            {/* 项目下拉选择 */}
+            <div className="relative">
+              <select 
+                value={activeProject.id}
+                onChange={(e) => handleSwitchProject(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-emerald-500 font-medium"
+              >
+                {settings.projects.map(p => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* 磁盘保存路径信息与文件夹授权入口 */}
+            <div className={`p-2.5 rounded border transition-all ${bridgeOnline ? 'bg-emerald-50/40 border-emerald-200' : 'bg-slate-50 border-slate-200/80'} flex items-center justify-between gap-2`}>
+              <div className="min-w-0 flex-1">
+                <div className="text-[10px] text-slate-500 flex items-center justify-between gap-1 mb-0.5">
+                  <span className="flex items-center gap-1 font-medium text-slate-600">
+                    <HardDrive className={`w-3 h-3 ${bridgeOnline ? 'text-emerald-600' : 'text-slate-500'}`} /> 磁盘落盘目标
+                  </span>
+                  {bridgeOnline ? (
+                    <span className="text-[9px] px-1.5 py-0.2 rounded font-mono bg-emerald-600 text-white font-medium flex items-center gap-0.5 shadow-2xs">
+                      ⚡ Bridge 免授权直写
+                    </span>
+                  ) : (
+                    <span className="text-[9px] px-1 py-0.2 rounded font-mono bg-emerald-100/70 text-emerald-800 border border-emerald-300/60 flex items-center gap-0.5">
+                      ✓ /dshWebSensor 就绪
+                    </span>
+                  )}
+                </div>
+                <div className="text-[11px] font-mono text-slate-800 truncate" title={fsHandleActive ? `${fsDirName}/dshWebSensor` : `${activeProject.workspacePath || '未绑定'}/dshWebSensor`}>
+                  {bridgeOnline ? (
+                    <span className="flex items-center gap-1">
+                      <span className="text-slate-800 font-medium">{activeProject.workspacePath}</span>
+                      <span className="text-emerald-700 font-semibold">/dshWebSensor</span>
+                    </span>
+                  ) : fsHandleActive ? (
+                    <span className="flex items-center gap-1">
+                      <span className="text-slate-700 font-medium">📁 {fsDirName}</span>
+                      <span className="text-emerald-700 font-semibold">/dshWebSensor</span>
+                    </span>
+                  ) : activeProject.workspacePath ? (
+                    <span className="flex items-center gap-1">
+                      <span className="text-slate-700">{activeProject.workspacePath}</span>
+                      <span className="text-emerald-700 font-semibold">/dshWebSensor</span>
+                    </span>
+                  ) : (
+                    <span className="text-amber-600 font-sans">待授权项目落盘目录</span>
+                  )}
+                </div>
+                <div className="text-[9px] text-slate-400 mt-0.5 truncate">
+                  {bridgeOnline 
+                    ? '⚡ 已连接本地伴侣服务：突破沙箱限制，无需任何授权直接物理写入磁盘！'
+                    : (fsHandleActive 
+                        ? '🛡️ Chrome 本地沙箱授权已绑定，线索自动存入 /dshWebSensor'
+                        : '💡 提示：双击运行 start_bridge.bat 即可彻底开启【免授权】全自动落盘')}
+                </div>
+              </div>
+
+              {bridgeOnline ? (
+                <div className="flex-shrink-0 flex items-center gap-1">
+                  <span className="text-[10px] px-2 py-1 rounded bg-emerald-100 text-emerald-800 font-medium border border-emerald-300/60 flex items-center gap-1">
+                    ✓ 免授权
+                  </span>
+                </div>
+              ) : (
+                <button 
+                  onClick={handleAuthorizeFolder}
+                  className="flex-shrink-0 px-2.5 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 rounded text-[11px] font-medium shadow-xs transition"
+                  title="受浏览器安全沙箱限制，如未启动 Bridge 需授权一次；启动 start_bridge.bat 即可完全免授权"
+                >
+                  {fsHandleActive ? '更改目录' : '授权目录'}
+                </button>
+              )}
+            </div>
+
+            {/* 主题标签流（支持多选） */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[11px] text-slate-600 flex items-center gap-1">
+                  <Tag className="w-3 h-3 text-emerald-600" /> 研究主题 
+                  <span className="text-[10px] text-emerald-700 font-semibold bg-emerald-50 px-1.5 py-0.2 rounded border border-emerald-200">
+                    多选 ({activeTopics.length})
+                  </span>
+                </span>
+                <div className="flex items-center gap-1.5 text-[10px]">
+                  <button 
+                    onClick={handleSelectAllTopics}
+                    className="text-slate-400 hover:text-emerald-700 transition cursor-pointer"
+                    title="全选当前项目下的所有主题"
+                  >
+                    全选
+                  </button>
+                  <span className="text-slate-300">·</span>
+                  <button 
+                    onClick={() => setShowAddTopic(!showAddTopic)}
+                    className="text-slate-400 hover:text-emerald-600 cursor-pointer"
+                  >
+                    {showAddTopic ? '取消' : '+ 新建'}
+                  </button>
+                </div>
+              </div>
+
+              {showAddTopic && (
+                <div className="flex gap-1 mb-2">
+                  <input 
+                    type="text" 
+                    placeholder="输入新主题名称..." 
+                    value={customTopicInput}
+                    onChange={(e) => setCustomTopicInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleAddTopicConfirm()}
+                    className="flex-1 bg-white border border-slate-200 rounded px-2 py-1 text-xs focus:border-emerald-500 focus:outline-none"
+                  />
+                  <button 
+                    onClick={handleAddTopicConfirm}
+                    className="px-2 py-1 bg-emerald-600 text-white rounded text-xs hover:bg-emerald-700"
+                  >
+                    添加并选中
+                  </button>
+                </div>
+              )}
+
+              <div className="flex flex-wrap gap-1">
+                {(activeProject.topics || ['General']).map(topic => {
+                  const isSelected = activeTopics.includes(topic);
+                  return (
+                    <button 
+                      key={topic}
+                      onClick={() => handleToggleTopic(topic)}
+                      className={`px-2 py-0.5 rounded-full text-[11px] transition flex items-center gap-1 ${
+                        isSelected 
+                          ? 'bg-emerald-600 text-white font-medium shadow-2xs ring-1 ring-emerald-500' 
+                          : 'bg-slate-100 hover:bg-slate-200 text-slate-600'
+                      }`}
+                      title={isSelected ? '已选中，点击取消' : '未选中，点击加入多选'}
+                    >
+                      {isSelected && <span className="text-[10px] leading-none font-bold">✓</span>}
+                      <span>{topic}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* 智能主题推荐 */}
+              {suggestedTopics.length > 0 && (
+                <div className="flex items-center flex-wrap gap-1 mt-2 pt-1.5 border-t border-slate-100">
+                  <span className="text-[10px] text-amber-700 flex items-center gap-0.5 font-medium">
+                    <Sparkles className="w-3 h-3 text-amber-500" /> 智能推荐:
+                  </span>
+                  {suggestedTopics.map(st => {
+                    const isAdded = activeTopics.includes(st);
+                    return (
+                      <button
+                        key={st}
+                        onClick={() => handleAddSuggestedTopic(st)}
+                        className={`px-1.5 py-0.5 rounded text-[10px] border transition flex items-center gap-0.5 ${
+                          isAdded
+                            ? 'bg-amber-100 text-amber-900 border-amber-300 font-medium'
+                            : 'bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-200'
+                        }`}
+                        title={isAdded ? '已在多选主题中' : '点击加入多选主题'}
+                      >
+                        {isAdded ? `✓ ${st}` : `+ ${st}`}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 核心采集动作卡片 */}
+          <div className="bg-white rounded-lg p-2.5 border border-slate-200 shadow-sm space-y-2">
+            <div className="text-[11px] font-medium text-slate-700 flex items-center gap-1.5">
+              <Download className="w-3.5 h-3.5 text-emerald-600" />
+              <span>当前页面快速提取</span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <button 
+                onClick={handleCaptureCurrentPage}
+                disabled={isProcessing}
+                className="flex items-center justify-center gap-1.5 p-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-md font-medium transition disabled:opacity-50"
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>抓取网页正文</span>
+              </button>
+
+              <button 
+                onClick={handleCaptureChatSession}
+                disabled={isProcessing}
+                className="flex items-center justify-center gap-1.5 p-2 bg-purple-50 hover:bg-purple-100 text-purple-800 border border-purple-200 rounded-md font-medium transition disabled:opacity-50"
+                title="归档当前 AI 对话完整会话 (DeepSeek / Claude / ChatGPT)"
+              >
+                <Bot className="w-3.5 h-3.5" />
+                <span>归档 AI 会话</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <button 
+                onClick={handleCaptureScreenshot}
+                disabled={isProcessing}
+                className="flex items-center justify-center gap-1.5 p-2 bg-sky-50 hover:bg-sky-100 text-sky-800 border border-sky-200 rounded-md font-medium transition disabled:opacity-50"
+                title="鼠标框选裁剪网页局部重点并添加数据标注，告诉 Agent 关注重点"
+              >
+                <Camera className="w-3.5 h-3.5 text-sky-600" />
+                <span>区域截图快照</span>
+              </button>
+
+              <button 
+                onClick={handleCaptureVideo}
+                disabled={isProcessing}
+                className="flex items-center justify-center gap-1.5 p-2 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 rounded-md font-medium transition disabled:opacity-50"
+                title="抓取当前 B站 或 YouTube 视频的播放时刻与元数据锚点"
+              >
+                <Video className="w-3.5 h-3.5 text-amber-600" />
+                <span>音视频锚点</span>
+              </button>
+            </div>
+
+            {/* AI 预处理提示 */}
+            <div className="flex items-center justify-between text-[10px] text-slate-400 pt-1 border-t border-slate-100">
+              <span className="flex items-center gap-1">
+                <Sparkles className="w-3 h-3 text-amber-500" />
+                DeepSeek 智能提纯打标
+              </span>
+              <span className={settings.deepseekApiKey ? "text-emerald-600 font-medium" : "text-slate-400"}>
+                {settings.deepseekApiKey ? '已就绪' : '未配 Key (基础抓取)'}
+              </span>
+            </div>
+          </div>
+
+          {/* 即时便签输入 */}
+          <div className="bg-white rounded-lg p-2.5 border border-slate-200 shadow-sm space-y-2">
+            <div className="flex items-center justify-between text-[11px] font-medium text-slate-700">
+              <span className="flex items-center gap-1.5">
+                <Bookmark className="w-3.5 h-3.5 text-blue-600" />
+                <span>调研快速灵感 / 便签</span>
+              </span>
+            </div>
+            <textarea 
+              rows={2}
+              placeholder="记录关于当前页面或调研的启发与线索..."
+              value={quickNote}
+              onChange={(e) => setQuickNote(e.target.value)}
+              className="w-full p-2 bg-slate-50 border border-slate-200 rounded text-xs focus:bg-white focus:border-emerald-500 focus:outline-none resize-none"
+            />
+            <div className="flex justify-end">
+              <button 
+                onClick={handleSaveQuickNote}
+                disabled={!quickNote.trim() || isProcessing}
+                className="px-3 py-1 bg-slate-800 hover:bg-slate-900 text-white rounded text-xs font-medium transition disabled:opacity-40"
+              >
+                存入线索库
+              </button>
+            </div>
+          </div>
+
+          {/* 最近采集线索流 */}
+          <div className="space-y-1.5 pt-1">
+            <div className="flex items-center justify-between text-[11px] font-medium text-slate-600 px-1">
+              <span>已采集资产 ({recentItems.length})</span>
+              <button onClick={loadData} className="text-slate-400 hover:text-slate-600">
+                <RefreshCw className="w-3 h-3" />
+              </button>
+            </div>
+
+            {recentItems.length === 0 ? (
+              <div className="p-4 text-center text-slate-400 bg-white rounded-lg border border-dashed border-slate-200">
+                暂无线索，可在网页中划词或点击上方按钮开始采集
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                {recentItems.slice(0, 10).map((item) => (
+                  <div key={item.id} className="p-2 bg-white rounded-md border border-slate-200 shadow-2xs hover:border-emerald-300 transition">
+                    <div className="flex items-start justify-between gap-1">
+                      <h4 className="font-medium text-slate-800 text-xs truncate flex-1" title={item.title}>
+                        {item.title}
+                      </h4>
+                      <span className="text-[9px] px-1 py-0.5 rounded bg-slate-100 text-slate-600 font-mono uppercase flex-shrink-0">
+                        {item.documentType}
+                      </span>
+                    </div>
+
+                    {item.aiSummary && (
+                      <p className="text-[10px] text-slate-500 mt-1 line-clamp-2 leading-relaxed bg-slate-50 p-1 rounded">
+                        💡 {item.aiSummary}
+                      </p>
+                    )}
+
+                    <div className="flex items-center justify-between mt-1.5 text-[10px] text-slate-400">
+                      <div className="flex items-center gap-1">
+                        <span className="text-emerald-700 font-medium">#{item.topic}</span>
+                        {item.tags?.slice(0, 2).map(t => (
+                          <span key={t} className="text-slate-400">· {t}</span>
+                        ))}
+                      </div>
+                      <span className="font-mono text-[9px]">{item.capturedAt.slice(11, 16)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </main>
+      )}
+
+      {/* 项目管理视图 */}
+      {currentView === 'projects' && (
+        <main className="flex-1 overflow-y-auto p-3 space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold text-slate-800 flex items-center gap-1.5">
+              <Layers className="w-4 h-4 text-emerald-600" /> 项目空间列表
+            </h2>
+            <button 
+              onClick={() => setCurrentView('workbench')}
+              className="text-slate-500 hover:text-slate-800 text-xs"
+            >
+              返回工作台
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            {settings.projects.map(p => (
+              <div key={p.id} className={`p-2.5 rounded-lg border transition ${p.id === activeProject.id ? 'bg-emerald-50/60 border-emerald-300' : 'bg-white border-slate-200'}`}>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-1.5">
+                    <h3 className="font-medium text-slate-800 text-xs">{p.name}</h3>
+                    <span className="text-[9px] px-1 py-0.2 rounded bg-emerald-100/70 text-emerald-800 font-mono">
+                      ✓ /dshWebSensor 就绪
+                    </span>
+                  </div>
+                  {p.id === activeProject.id ? (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-600 text-white font-medium">当前活跃</span>
+                  ) : (
+                    <button 
+                      onClick={() => handleSwitchProject(p.id)}
+                      className="text-[10px] text-emerald-600 hover:text-emerald-700 font-medium hover:underline"
+                    >
+                      切换并激活
+                    </button>
+                  )}
+                </div>
+                <div className="text-[10px] text-slate-500 mt-1 font-mono truncate flex items-center gap-1">
+                  <span>落盘目标:</span>
+                  <span className="text-slate-700">{p.workspacePath}</span>
+                  <span className="text-emerald-700 font-semibold">/dshWebSensor</span>
+                </div>
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  {p.topics.map(t => (
+                    <span key={t} className="text-[9px] px-1.5 py-0.2 bg-slate-100 text-slate-600 rounded">
+                      {t}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* 新增项目表单 */}
+          <div className="bg-white p-3 rounded-lg border border-slate-200 space-y-2">
+            <h3 className="font-medium text-slate-700 text-xs">+ 新建项目空间</h3>
+            <div>
+              <label className="text-[10px] text-slate-500">项目名称</label>
+              <input 
+                type="text"
+                placeholder="例如: AI-Agent-调研"
+                value={newProjName}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setNewProjName(val);
+                  if (!tempDirHandle && (!newProjPath || newProjPath.startsWith('D:/KnowledgeBase/'))) {
+                    setNewProjPath(val ? `D:/KnowledgeBase/${val.trim()}` : '');
+                  }
+                }}
+                className="w-full p-1.5 mt-0.5 bg-slate-50 border border-slate-200 rounded text-xs focus:bg-white focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+            <div>
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] text-slate-500">本地磁盘目标路径</label>
+                <button
+                  type="button"
+                  onClick={handleBrowseNewProjectFolder}
+                  className="text-[10px] text-emerald-700 hover:text-emerald-900 flex items-center gap-1 font-medium hover:underline cursor-pointer"
+                  title="调起系统文件夹选取框，选取后自动创建 /dshWebSensor 子目录"
+                >
+                  <HardDrive className="w-3 h-3" /> 📁 浏览目录
+                </button>
+              </div>
+              <input 
+                type="text"
+                placeholder="例如: D:/KnowledgeBase/AI-Agent (或点击浏览目录选取)"
+                value={newProjPath}
+                onChange={(e) => setNewProjPath(e.target.value)}
+                className="w-full p-1.5 mt-0.5 bg-slate-50 border border-slate-200 rounded text-xs focus:bg-white focus:border-emerald-500 focus:outline-none font-mono"
+              />
+              <div className="mt-1 p-1.5 rounded bg-emerald-50/70 border border-emerald-200/80 text-[10px] text-emerald-800 space-y-0.5">
+                <div className="flex items-center gap-1 font-medium">
+                  <Sparkles className="w-3 h-3 text-emerald-600" />
+                  <span>自动建议落盘空间:</span>
+                </div>
+                <div className="font-mono text-[9px] text-emerald-900 truncate">
+                  {newProjPath || (newProjName ? `D:/KnowledgeBase/${newProjName}` : 'D:/KnowledgeBase/新项目')}
+                  <span className="font-bold text-emerald-700">/dshWebSensor</span>
+                </div>
+                <p className="text-[9px] text-emerald-700/80">
+                  ✓ 创建或选取后将立即自动建立 /dshWebSensor 文件夹，无需手动新建。
+                </p>
+              </div>
+            </div>
+            <div>
+              <label className="text-[10px] text-slate-500">默认主题 (逗号分隔)</label>
+              <input 
+                type="text"
+                value={newProjTopics}
+                onChange={(e) => setNewProjTopics(e.target.value)}
+                className="w-full p-1.5 mt-0.5 bg-slate-50 border border-slate-200 rounded text-xs focus:bg-white focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+            <button 
+              onClick={handleCreateProject}
+              className="w-full py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-medium transition"
+            >
+              创建项目并就绪 /dshWebSensor
+            </button>
+          </div>
+
+          {/* 常用大目录项目自动发现卡片 */}
+          <div className="bg-slate-100/90 p-3 rounded-lg border border-slate-200 space-y-2">
+            <div className="flex items-center justify-between">
+              <h3 className="font-medium text-slate-800 text-xs flex items-center gap-1">
+                <Compass className="w-3.5 h-3.5 text-blue-600" /> 常用大目录自动发现项目
+              </h3>
+              {frequentParentDirs.length > 0 && (
+                <span className="text-[10px] text-slate-500">已学习 {frequentParentDirs.length} 个大目录</span>
+              )}
+            </div>
+
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              基于操作行为记录，自动探测扫描常用工作大目录下的子项目与已存在的 /dshWebSensor。
+            </p>
+
+            <div className="flex gap-1.5">
+              <input 
+                type="text"
+                placeholder="输入或选择常用大目录 (如 D:/Projects 或 D:/KnowledgeBase)"
+                value={parentScanDir}
+                onChange={(e) => setParentScanDir(e.target.value)}
+                className="flex-1 p-1.5 bg-white border border-slate-200 rounded text-xs focus:outline-none font-mono"
+              />
+              <button
+                onClick={handleScanParentDir}
+                disabled={isScanning || !parentScanDir.trim()}
+                className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-medium transition disabled:opacity-40 flex items-center gap-1 flex-shrink-0"
+              >
+                <Search className={`w-3 h-3 ${isScanning ? 'animate-spin' : ''}`} />
+                {isScanning ? '扫描中...' : '扫描发现'}
+              </button>
+            </div>
+
+            {/* 快速选择已有父目录快捷项 */}
+            {frequentParentDirs.length > 0 && (
+              <div className="flex items-center flex-wrap gap-1 text-[10px] text-slate-500 pt-0.5">
+                <span>高频目录:</span>
+                {frequentParentDirs.map(dir => (
+                  <button
+                    key={dir}
+                    onClick={() => {
+                      setParentScanDir(dir);
+                      discoverProjectsInDirectory(dir).then(setDiscoveredProjects);
+                    }}
+                    className="px-1.5 py-0.5 rounded bg-white hover:bg-slate-200 text-slate-700 border border-slate-200 font-mono text-[9px]"
+                  >
+                    {dir.split(/[\\/]/).pop() || dir}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* 发现的子项目列表 */}
+            {discoveredProjects.length > 0 && (
+              <div className="mt-2 space-y-1.5 max-h-40 overflow-y-auto bg-white p-2 rounded border border-slate-200">
+                <div className="text-[10px] text-slate-400 font-medium">发现 {discoveredProjects.length} 个子项目文件夹:</div>
+                {discoveredProjects.map(proj => {
+                  const isImported = settings.projects.some(p => p.workspacePath === proj.path || p.name === proj.name);
+                  return (
+                    <div key={proj.path} className="flex items-center justify-between p-1.5 bg-slate-50 hover:bg-slate-100 rounded text-xs">
+                      <div className="truncate flex-1 mr-2">
+                        <span className="font-medium text-slate-800">{proj.name}</span>
+                        {proj.hasDshSensor && (
+                          <span className="ml-1.5 text-[9px] px-1 py-0.2 rounded bg-emerald-100 text-emerald-700 font-mono font-medium">
+                            已含 dshWebSensor
+                          </span>
+                        )}
+                      </div>
+                      {isImported ? (
+                        <span className="text-[10px] text-slate-400 font-medium">已在列表</span>
+                      ) : (
+                        <button
+                          onClick={() => handleImportDiscoveredProject(proj)}
+                          className="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[10px] font-medium"
+                        >
+                          导入项目
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </main>
+      )}
+
+      {/* 配置中心视图 */}
+      {currentView === 'settings' && (
+        <main className="flex-1 overflow-y-auto p-3 space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold text-slate-800 flex items-center gap-1.5">
+              <Settings className="w-4 h-4 text-emerald-600" /> 扩展配置中心
+            </h2>
+            <button 
+              onClick={() => setCurrentView('workbench')}
+              className="text-slate-500 hover:text-slate-800 text-xs"
+            >
+              返回工作台
+            </button>
+          </div>
+
+          {/* DeepSeek API 配置 */}
+          <div className="bg-white p-3 rounded-lg border border-slate-200 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-slate-800 flex items-center gap-1">
+                <Sparkles className="w-3.5 h-3.5 text-amber-500" /> DeepSeek API 配置
+              </span>
+              <a 
+                href="https://platform.deepseek.com/api_keys" 
+                target="_blank" 
+                rel="noreferrer"
+                className="text-[10px] text-emerald-600 hover:underline"
+              >
+                获取 Key ↗
+              </a>
+            </div>
+            <div>
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] text-slate-500">API Key</label>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSyncEnvKey}
+                    className="text-[9px] text-blue-600 hover:text-blue-800 hover:underline flex items-center gap-0.5 font-medium"
+                    title="从本地 Bridge 服务读取系统环境变量中的 DEEPSEEK_API_KEY"
+                  >
+                    从系统环境同步
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowApiKey(!showApiKey)}
+                    className="text-slate-400 hover:text-slate-600"
+                    title={showApiKey ? '隐藏 Key' : '显示 Key'}
+                  >
+                    {showApiKey ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                  </button>
+                </div>
+              </div>
+              <input 
+                type={showApiKey ? 'text' : 'password'}
+                placeholder="sk-..."
+                value={settings.deepseekApiKey}
+                onChange={(e) => setSettings({ ...settings, deepseekApiKey: e.target.value })}
+                className="w-full p-1.5 mt-0.5 bg-slate-50 border border-slate-200 rounded text-xs focus:bg-white focus:border-emerald-500 focus:outline-none font-mono"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <div className="flex items-center justify-between">
+                  <label className="text-[10px] text-slate-500">模型选择</label>
+                  <button 
+                    type="button"
+                    onClick={handleRefreshModels}
+                    disabled={isRefreshingModels || !settings.deepseekApiKey}
+                    className="text-[9px] text-emerald-600 hover:underline flex items-center gap-0.5 disabled:opacity-40"
+                    title="从 DeepSeek 官方接口 (GET /models) 拉取当前最新模型"
+                  >
+                    <RefreshCw className={`w-2.5 h-2.5 ${isRefreshingModels ? 'animate-spin' : ''}`} /> 刷新
+                  </button>
+                </div>
+                <select 
+                  value={availableModels.includes(settings.deepseekModel) ? settings.deepseekModel : 'custom'}
+                  onChange={(e) => {
+                    if (e.target.value !== 'custom') {
+                      setSettings({ ...settings, deepseekModel: e.target.value });
+                    }
+                  }}
+                  className="w-full p-1.5 mt-0.5 bg-slate-50 border border-slate-200 rounded text-xs focus:outline-none font-mono"
+                >
+                  {availableModels.map(m => {
+                    let desc = m;
+                    if (m === 'deepseek-flash' || m === 'deepseek flash') desc = `DeepSeek V4.1 Flash (${m})`;
+                    else if (m === 'deepseek-v4-pro') desc = `DeepSeek-V4 Pro (${m})`;
+                    else if (m === 'deepseek-chat') desc = `DeepSeek-V3 (${m})`;
+                    else if (m === 'deepseek-reasoner') desc = `DeepSeek-R1 (${m})`;
+                    return <option key={m} value={m}>{desc}</option>;
+                  })}
+                  <option value="custom">-- 自定义其他模型 --</option>
+                </select>
+                {(!availableModels.includes(settings.deepseekModel) || settings.deepseekModel === 'custom') && (
+                  <input 
+                    type="text"
+                    placeholder="输入模型标识符..."
+                    value={settings.deepseekModel === 'custom' ? '' : settings.deepseekModel}
+                    onChange={(e) => setSettings({ ...settings, deepseekModel: e.target.value })}
+                    className="w-full p-1 mt-1 bg-white border border-slate-200 rounded text-xs font-mono"
+                  />
+                )}
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-500">API Base URL</label>
+                <input 
+                  type="text"
+                  value={settings.deepseekBaseUrl}
+                  onChange={(e) => setSettings({ ...settings, deepseekBaseUrl: e.target.value })}
+                  className="w-full p-1.5 mt-0.5 bg-slate-50 border border-slate-200 rounded text-xs focus:outline-none font-mono text-[11px]"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* DSH 本地 Bridge 伴侣服务配置 */}
+          <div className="bg-white p-3 rounded-lg border border-slate-200 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-slate-800 flex items-center gap-1">
+                <Terminal className="w-3.5 h-3.5 text-blue-600" /> DSH 本地 Bridge 服务 (轨 B)
+              </span>
+              <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${bridgeOnline ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-500'}`}>
+                {bridgeOnline ? '在线' : '离线'}
+              </span>
+            </div>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              运行仓库中的 <code>python server/dsh_bridge.py</code> 即可启动本地守护服务，无需浏览器手动授权即可突破沙箱直接写入任意物理磁盘路径。
+            </p>
+            <div>
+              <label className="text-[10px] text-slate-500">Bridge 监听地址</label>
+              <input 
+                type="text"
+                value={settings.bridgeUrl}
+                onChange={(e) => setSettings({ ...settings, bridgeUrl: e.target.value })}
+                className="w-full p-1.5 mt-0.5 bg-slate-50 border border-slate-200 rounded text-xs focus:outline-none font-mono text-[11px]"
+              />
+            </div>
+          </div>
+
+          <button 
+            onClick={async () => {
+              await saveSettings(settings);
+              showToast('配置已保存生效');
+              loadData();
+              setCurrentView('workbench');
+            }}
+            className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-semibold shadow-xs transition"
+          >
+            保存所有配置
+          </button>
+        </main>
+      )}
+
+      {/* 底部 Footer 状态条 */}
+      <footer className="px-3 py-1.5 bg-white border-t border-slate-200 text-[10px] text-slate-400 flex items-center justify-between">
+        <span className="truncate max-w-[200px]" title={activeTab.title}>
+          {activeTab.title || '就绪'}
+        </span>
+        <span className="font-mono">DSH Harness Agent</span>
+      </footer>
+    </div>
+  );
+}

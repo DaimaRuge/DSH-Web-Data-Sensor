@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "DSH Web Sensor - 知识采集与预处理",
+  "version": "1.0.0",
+  "description": "DSH (DeepSeek Harness) 个人文献与知识智能体前端多模态数据采集与预处理插件",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "打开 DSH 调研工作台"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "options_page": "options.html",
+  "background": {
+    "service_worker": "src/background/index.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/index.ts"],
+      "run_at": "document_end"
+    }
+  ],
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "downloads",
+    "activeTab",
+    "scripting",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}
