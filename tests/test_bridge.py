@@ -265,6 +265,77 @@ def test_init_sensor_workspace():
         assert ready_data["project_name"] == "DeepSeekProject"
         print(f"[Test Pass] 成功验证 /api/workspace/init_sensor 自动建立 dshWebSensor 子目录: {sensor_path}")
 
+def test_captured_item_url_guarantee_and_types():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_cases = [
+            {
+                "id": "url-test-web",
+                "title": "公网 DeepSeek 测试",
+                "url": "https://chat.deepseek.com/c/123",
+                "expected_type": "web",
+                "expected_url": "https://chat.deepseek.com/c/123"
+            },
+            {
+                "id": "url-test-local-file",
+                "title": "本地文献 PDF 测试",
+                "url": "file:///D:/research/survey.pdf",
+                "expected_type": "local_file",
+                "expected_url": "file:///D:/research/survey.pdf"
+            },
+            {
+                "id": "url-test-local-app",
+                "title": "本地服务端口测试",
+                "url": "http://localhost:3000/dashboard",
+                "expected_type": "local_app",
+                "expected_url": "http://localhost:3000/dashboard"
+            },
+            {
+                "id": "url-test-empty-fallback",
+                "title": "无 URL 自动兜底测试",
+                "url": "",
+                "expected_type": "local_note",
+                "expected_url": "local://dsh/capture/url-test-empty-fallback"
+            },
+            {
+                "id": "url-test-note",
+                "title": "侧边栏快速便签测试",
+                "url": "local://dsh/quick-note?id=note-456",
+                "expected_type": "local_note",
+                "expected_url": "local://dsh/quick-note?id=note-456"
+            }
+        ]
+
+        for tc in test_cases:
+            payload = {
+                "workspace_path": tmpdir,
+                "item": {
+                    "id": tc["id"],
+                    "project": "URL-Test-Project",
+                    "topic": "URL-Verification",
+                    "title": tc["title"],
+                    "url": tc["url"],
+                    "sourcePlatform": "web_article",
+                    "capturedAt": "2026-09-21T12:00:00+08:00",
+                    "documentType": "article",
+                    "tags": ["URLTest"],
+                    "markdownContent": f"# {tc['title']}\n\n> 来源: [{tc['expected_url']}]({tc['expected_url']})"
+                }
+            }
+
+            res = client.post("/api/save_bundle", json=payload)
+            assert res.status_code == 200, f"Failed for {tc['id']}: {res.text}"
+            res_data = res.json()
+            assert res_data["success"] is True
+
+            saved_path = Path(res_data["saved_path"])
+            meta = json.loads((saved_path / "metadata.json").read_text(encoding="utf-8"))
+
+            assert meta["url"] == tc["expected_url"], f"URL mismatch for {tc['id']}: {meta['url']} vs {tc['expected_url']}"
+            assert meta["url_type"] == tc["expected_type"], f"url_type mismatch for {tc['id']}: {meta['url_type']} vs {tc['expected_type']}"
+            assert len(meta["url"].strip()) > 0, f"URL must not be empty for {tc['id']}"
+
+        print("[Test Pass] 成功验证公网 URL、本地文件 file:///、localhost 以及兜底 URL 100% 具备有效 URL 与正确的 url_type！")
+
 if __name__ == "__main__":
     test_health_check()
     test_init_sensor_workspace()
@@ -273,4 +344,5 @@ if __name__ == "__main__":
     test_telemetry_and_insights()
     test_discover_projects_in_parent()
     test_save_bundle_with_multi_topics()
+    test_captured_item_url_guarantee_and_types()
     print("\n🎉 所有后端与 Bridge 测试 100% 成功通过！")

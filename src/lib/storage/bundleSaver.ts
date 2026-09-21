@@ -1,4 +1,4 @@
-import { CapturedItem } from '@/types';
+import { CapturedItem, resolveUrlType } from '@/types';
 import { getSettings, getActiveProject } from './settings';
 import { getWorkspaceDirectoryHandle, saveBundleViaFsAccess } from './fsAccess';
 import { checkBridgeHealth, saveBundleViaBridge } from './bridgeClient';
@@ -50,8 +50,21 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
 
   const primaryTopic = itemToSave.topic || activeTopics.join('+');
 
+  // URL 完整性守卫：强制确保所有入库数据 100% 具备非空有效 URL（本地或网络）
+  let safeUrl = (itemToSave.url && itemToSave.url.trim().length > 0) ? itemToSave.url.trim() : '';
+  if (!safeUrl) {
+    if (typeof window !== 'undefined' && window.location?.href && !window.location.href.startsWith('chrome-extension://')) {
+      safeUrl = window.location.href;
+    } else {
+      safeUrl = `local://dsh/capture/${itemToSave.id || Date.now()}`;
+    }
+  }
+  const safeUrlType = itemToSave.urlType || resolveUrlType(safeUrl);
+
   const item: CapturedItem = {
     ...itemToSave,
+    url: safeUrl,
+    urlType: safeUrlType,
     project: itemToSave.project || project.name,
     topic: primaryTopic,
     topics: activeTopics,
@@ -177,7 +190,41 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
         saveAs: false,
       });
 
-      // 4.2 下载附件（如截图快照）
+      // 4.2 下载 metadata.json（确保具备完整的元数据与来源 URL）
+      const metaObj = {
+        id: item.id,
+        project: item.project,
+        topic: item.topic,
+        topics: item.topics || [item.topic],
+        title: item.title,
+        url: item.url,
+        url_type: item.urlType || resolveUrlType(item.url),
+        source_platform: item.sourcePlatform,
+        captured_at: item.capturedAt,
+        document_type: item.documentType,
+        tags: item.tags,
+        ai_summary: item.aiSummary || '',
+        user_notes: item.userNotes || '',
+        ai_metadata: item.aiMetadata || {},
+        is_screenshot: item.documentType === 'screenshot',
+        screenshot_metadata: item.screenshotMetadata || null,
+        media_attachments: (item.mediaAttachments || []).map(m => ({
+          id: m.id,
+          type: m.type,
+          original_url: m.originalUrl,
+          filename: m.filename,
+          local_path: m.localPath,
+        })),
+      };
+      const metaBlob = new Blob([JSON.stringify(metaObj, null, 2)], { type: 'application/json;charset=utf-8' });
+      const metaUrl = URL.createObjectURL(metaBlob);
+      chrome.downloads.download({
+        url: metaUrl,
+        filename: `${folder}/metadata.json`,
+        saveAs: false,
+      });
+
+      // 4.3 下载附件（如截图快照）
       for (const att of (item.mediaAttachments || [])) {
         if (att.blobDataUrl) {
           chrome.downloads.download({

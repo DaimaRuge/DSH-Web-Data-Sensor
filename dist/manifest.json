@@ -22,10 +22,11 @@
   "content_scripts": [
     {
       "js": [
-        "assets/index.ts-8kDxB8f1.js"
+        "assets/index.ts-loader-DYqrkT5V.js"
       ],
       "matches": [
-        "<all_urls>"
+        "<all_urls>",
+        "file:///*"
       ],
       "run_at": "document_end"
     }
@@ -39,15 +40,18 @@
     "contextMenus"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "file:///*"
   ],
   "web_accessible_resources": [
     {
       "matches": [
-        "<all_urls>"
+        "<all_urls>",
+        "file:///*"
       ],
       "resources": [
-        "assets/index.ts-8kDxB8f1.js"
+        "assets/index-K1G2e5ai.js",
+        "assets/index.ts-CywaZl4k.js"
       ],
       "use_dynamic_url": false
     }

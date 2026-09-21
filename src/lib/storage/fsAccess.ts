@@ -1,5 +1,5 @@
 import { get, set, del } from 'idb-keyval';
-import { CapturedItem } from '@/types';
+import { CapturedItem, resolveUrlType } from '@/types';
 
 const DIR_HANDLE_PREFIX = 'dsh_fs_dir_handle_';
 
@@ -142,6 +142,7 @@ export async function saveBundleViaFsAccess(
     topics: item.topics || [item.topic],
     title: item.title,
     url: item.url,
+    url_type: item.urlType || resolveUrlType(item.url),
     source_platform: item.sourcePlatform,
     captured_at: item.capturedAt,
     document_type: item.documentType,

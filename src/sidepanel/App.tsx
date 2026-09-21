@@ -6,7 +6,7 @@ import {
   Eye, EyeOff, Search, Compass
 } from 'lucide-react';
 import { set as setIdb } from 'idb-keyval';
-import { PluginSettings, DEFAULT_SETTINGS, ProjectConfig, CapturedItem } from '@/types';
+import { PluginSettings, DEFAULT_SETTINGS, ProjectConfig, CapturedItem, resolveUrlType } from '@/types';
 import { getSettings, saveSettings, updateProject } from '@/lib/storage/settings';
 import { pickWorkspaceDirectory, getWorkspaceDirectoryHandle, ensureSensorDirectoryOnHandle } from '@/lib/storage/fsAccess';
 import { checkBridgeHealth, fetchSystemEnvFromBridge, initSensorWorkspaceViaBridge } from '@/lib/storage/bridgeClient';
@@ -89,53 +89,78 @@ export default function App() {
     setRecentItems(history);
   }, []);
 
+  // 动态精准获取当前活跃聚焦的标签页信息（支持本地 file:/// 与网络 http/https）
+  const refreshActiveTab = useCallback(async (): Promise<{ id?: number; title?: string; url?: string }> => {
+    return new Promise((resolve) => {
+      if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query) {
+        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+          if (tabs && tabs[0]) {
+            const tab = tabs[0];
+            const tabInfo = {
+              id: tab.id,
+              title: tab.title || '当前标签页',
+              url: tab.url || 'about:blank',
+            };
+            setActiveTab(tabInfo);
+
+            if (tab.url) {
+              try {
+                const domain = tab.url.startsWith('file://') ? 'local_file' : (new URL(tab.url).hostname || 'local');
+                fetchTelemetryInsights(domain).then(insights => {
+                  if (insights) {
+                    if (insights.suggestedTopicsForCurrentDomain) {
+                      setSuggestedTopics(insights.suggestedTopicsForCurrentDomain);
+                    }
+                    if (insights.frequentParentDirs && insights.frequentParentDirs.length > 0) {
+                      setFrequentParentDirs(insights.frequentParentDirs);
+                      setParentScanDir(prev => prev || insights.frequentParentDirs[0]);
+                    }
+                  }
+                });
+
+                trackEvent({
+                  eventType: 'page_view',
+                  projectId: settings.activeProjectId,
+                  url: tab.url,
+                  domain,
+                  pageTitle: tab.title,
+                }).catch(() => {});
+              } catch {}
+            }
+            resolve(tabInfo);
+            return;
+          }
+          resolve({});
+        });
+      } else {
+        resolve({});
+      }
+    });
+  }, [settings.activeProjectId]);
+
   useEffect(() => {
     loadData();
+    refreshActiveTab();
 
-    // 获取当前标签页信息
-    if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query) {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]) {
-          const tab = tabs[0];
-          setActiveTab({
-            id: tab.id,
-            title: tab.title,
-            url: tab.url,
-          });
+    // 实时监听标签页切换与地址变更，使 Side Panel 始终与当前焦点页面保持完全同步
+    const onTabActivated = () => {
+      refreshActiveTab();
+    };
+    const onTabUpdated = (_tabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+      if (changeInfo.status === 'complete' || changeInfo.url) {
+        refreshActiveTab();
+      }
+    };
 
-          // 根据当前访问页面的 domain 获取智能主题推荐
-          if (tab.url) {
-            try {
-              const domain = new URL(tab.url).hostname;
-              fetchTelemetryInsights(domain).then(insights => {
-                if (insights) {
-                  if (insights.suggestedTopicsForCurrentDomain) {
-                    setSuggestedTopics(insights.suggestedTopicsForCurrentDomain);
-                  }
-                  if (insights.frequentParentDirs && insights.frequentParentDirs.length > 0) {
-                    setFrequentParentDirs(insights.frequentParentDirs);
-                    setParentScanDir(prev => prev || insights.frequentParentDirs[0]);
-                  }
-                }
-              });
-
-              // 页面行为埋点
-              trackEvent({
-                eventType: 'page_view',
-                projectId: settings.activeProjectId,
-                url: tab.url,
-                domain,
-                pageTitle: tab.title,
-              }).catch(() => {});
-            } catch {}
-          }
-        }
-      });
+    if (typeof chrome !== 'undefined' && chrome.tabs) {
+      chrome.tabs.onActivated?.addListener(onTabActivated);
+      chrome.tabs.onUpdated?.addListener(onTabUpdated);
     }
 
     // 监听实时线索落盘通知（如截图快照完成或抓取保存）
+    let handleRuntimeMsg: ((msg: any) => void) | null = null;
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
-      const handleRuntimeMsg = (msg: any) => {
+      handleRuntimeMsg = (msg: any) => {
         if (msg.type === 'ITEM_SAVED_EVENT') {
           loadData();
           if (msg.payload?.title) {
@@ -144,9 +169,18 @@ export default function App() {
         }
       };
       chrome.runtime.onMessage.addListener(handleRuntimeMsg);
-      return () => chrome.runtime.onMessage.removeListener(handleRuntimeMsg);
     }
-  }, [loadData]);
+
+    return () => {
+      if (typeof chrome !== 'undefined' && chrome.tabs) {
+        chrome.tabs.onActivated?.removeListener(onTabActivated);
+        chrome.tabs.onUpdated?.removeListener(onTabUpdated);
+      }
+      if (handleRuntimeMsg && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
+        chrome.runtime.onMessage.removeListener(handleRuntimeMsg);
+      }
+    };
+  }, [loadData, refreshActiveTab]);
 
   const activeProject = settings.projects.find(p => p.id === settings.activeProjectId) || settings.projects[0];
 
@@ -329,30 +363,34 @@ export default function App() {
 
   // 1-Click 抓取网页正文
   const handleCaptureCurrentPage = async () => {
-    if (!activeTab.id) {
+    const curTab = await refreshActiveTab();
+    if (!curTab.id) {
       showToast('未检测到活跃标签页', true);
       return;
     }
     setIsProcessing(true);
-    chrome.tabs.sendMessage(activeTab.id, { type: 'CAPTURE_FULL_PAGE' }, (response) => {
+    chrome.tabs.sendMessage(curTab.id, { type: 'CAPTURE_FULL_PAGE' }, (response) => {
       setIsProcessing(false);
       if (response && response.success) {
         showToast('正文抓取成功并已开始落盘！');
         loadData();
       } else {
-        showToast(`抓取遇到问题: ${response?.error || '页面可能未完全加载'}`, true);
+        const isLocal = curTab.url?.startsWith('file://');
+        const hint = isLocal ? '（提示：检测到本地 file:/// 文件，若尚未注入，请在 chrome://extensions 详情中开启“允许访问文件网址”）' : '';
+        showToast(`抓取遇到问题: ${response?.error || '页面可能未完全加载'}${hint}`, true);
       }
     });
   };
 
   // 1-Click 归档 AI 对话会话
   const handleCaptureChatSession = async () => {
-    if (!activeTab.id) {
+    const curTab = await refreshActiveTab();
+    if (!curTab.id) {
       showToast('未检测到活跃标签页', true);
       return;
     }
     setIsProcessing(true);
-    chrome.tabs.sendMessage(activeTab.id, { type: 'CAPTURE_CHAT_SESSION' }, (response) => {
+    chrome.tabs.sendMessage(curTab.id, { type: 'CAPTURE_CHAT_SESSION' }, (response) => {
       setIsProcessing(false);
       if (response && response.success) {
         showToast('整场 AI 对话已成功归档！');
@@ -365,12 +403,13 @@ export default function App() {
 
   // 1-Click 抓取视频时间戳线索
   const handleCaptureVideo = async () => {
-    if (!activeTab.id) {
+    const curTab = await refreshActiveTab();
+    if (!curTab.id) {
       showToast('未检测到活跃标签页', true);
       return;
     }
     setIsProcessing(true);
-    chrome.tabs.sendMessage(activeTab.id, { type: 'CAPTURE_VIDEO_CUE' as any }, (response) => {
+    chrome.tabs.sendMessage(curTab.id, { type: 'CAPTURE_VIDEO_CUE' as any }, (response) => {
       setIsProcessing(false);
       if (response && response.success) {
         showToast('视频时间轴线索已成功落盘！');
@@ -383,13 +422,16 @@ export default function App() {
 
   // 1-Click 网页区域截图快照与视觉数据标注
   const handleCaptureScreenshot = async () => {
-    if (!activeTab.id) {
+    const curTab = await refreshActiveTab();
+    if (!curTab.id) {
       showToast('未检测到活跃标签页', true);
       return;
     }
-    chrome.tabs.sendMessage(activeTab.id, { type: 'START_SCREENSHOT_CAPTURE' }, () => {
+    chrome.tabs.sendMessage(curTab.id, { type: 'START_SCREENSHOT_CAPTURE' }, () => {
       if (chrome.runtime.lastError) {
-        showToast('唤起截图失败，请刷新目标页面重试', true);
+        const isLocal = curTab.url?.startsWith('file://');
+        const hint = isLocal ? '。本地 file:/// 文件需在扩展管理中勾选【允许访问文件网址】' : '，请刷新目标页面重试';
+        showToast(`唤起截图失败${hint}`, true);
       }
     });
   };
@@ -398,18 +440,28 @@ export default function App() {
   const handleSaveQuickNote = async () => {
     if (!quickNote.trim()) return;
     setIsProcessing(true);
+    const curTab = await refreshActiveTab();
+    const noteId = `note-${Date.now()}`;
+    
+    // 无论是公网网页还是本地 file:/// 文件，均准确提取关联 URL；在无网页标签时生成标准本地便签 URL
+    const noteUrl = (curTab.url && curTab.url !== 'about:blank')
+      ? curTab.url
+      : `local://dsh/quick-note?id=${noteId}&time=${Date.now()}`;
+    const noteUrlType = resolveUrlType(noteUrl);
+
     const item: CapturedItem = {
-      id: `note-${Date.now()}`,
+      id: noteId,
       project: activeProject.name,
       topic: activeTopics.join('+'),
       topics: activeTopics,
       title: `调研便签: ${quickNote.slice(0, 20)}...`,
-      url: activeTab.url || 'local://quick-note',
-      sourcePlatform: 'other',
+      url: noteUrl,
+      urlType: noteUrlType,
+      sourcePlatform: noteUrlType === 'local_file' ? 'local_file' : (noteUrl.includes('deepseek.com') ? 'deepseek' : 'other'),
       capturedAt: new Date().toISOString(),
       documentType: 'note',
       tags: ['QuickNote', 'Idea', ...activeTopics],
-      markdownContent: `### 📝 快速调研备忘便签\n\n${quickNote}\n\n---\n> 🏷️ **归属主题**: ${activeTopics.join('、')}\n> ⏰ 记录时刻: ${new Date().toLocaleString()}\n> 关联页面: [${activeTab.title || '无'}](${activeTab.url || '#'})`,
+      markdownContent: `### 📝 快速调研备忘便签\n\n${quickNote}\n\n---\n> 🏷️ **归属主题**: ${activeTopics.join('、')}\n> ⏰ **记录时刻**: ${new Date().toLocaleString()}\n> 🌐 **关联 URL**: [${curTab.title || noteUrl}](${noteUrl})\n> 📌 **URL 类型**: ${noteUrlType === 'web' ? '公网网址' : (noteUrlType === 'local_file' ? '本地文件 (file:///)' : '本地便签')}`,
       mediaAttachments: [],
     };
 
@@ -1386,11 +1438,28 @@ export default function App() {
       )}
 
       {/* 底部 Footer 状态条 */}
-      <footer className="px-3 py-1.5 bg-white border-t border-slate-200 text-[10px] text-slate-400 flex items-center justify-between">
-        <span className="truncate max-w-[200px]" title={activeTab.title}>
-          {activeTab.title || '就绪'}
-        </span>
-        <span className="font-mono">DSH Harness Agent</span>
+      <footer className="px-3 py-1.5 bg-white border-t border-slate-200 text-[10px] text-slate-500 flex items-center justify-between">
+        <div className="flex items-center gap-1.5 truncate max-w-[220px]" title={activeTab.url ? `${activeTab.title} (${activeTab.url})` : activeTab.title}>
+          {activeTab.url?.startsWith('file://') ? (
+            <span className="flex-shrink-0 px-1 py-0.2 rounded bg-amber-100 text-amber-800 font-mono text-[9px] flex items-center gap-0.5" title="本地文件 URL (file:///)">
+              📁 本地文件
+            </span>
+          ) : activeTab.url?.startsWith('http://localhost') || activeTab.url?.startsWith('http://127.0.0.1') ? (
+            <span className="flex-shrink-0 px-1 py-0.2 rounded bg-purple-100 text-purple-800 font-mono text-[9px] flex items-center gap-0.5" title="本地开发服务">
+              ⚡ 本地服务
+            </span>
+          ) : activeTab.url?.startsWith('http') ? (
+            <span className="flex-shrink-0 px-1 py-0.2 rounded bg-sky-100 text-sky-800 font-mono text-[9px] flex items-center gap-0.5" title="互联网 Web 链接">
+              🌐 网络
+            </span>
+          ) : (
+            <span className="flex-shrink-0 px-1 py-0.2 rounded bg-slate-100 text-slate-600 font-mono text-[9px] flex items-center gap-0.5">
+              📝 本地
+            </span>
+          )}
+          <span className="truncate text-slate-700 font-medium">{activeTab.title || '就绪'}</span>
+        </div>
+        <span className="font-mono text-[10px] text-slate-400">DSH Web Sensor</span>
       </footer>
     </div>
   );

@@ -3,7 +3,12 @@ import { ExtractedTurn } from '@/lib/chatAdapters/types';
 import { parseCurrentPageArticle } from '@/lib/parser/readability';
 import { captureVideoCue } from '@/lib/chatAdapters/videoAdapter';
 import { startInteractiveScreenshot } from './screenshotCropper';
-import { CapturedItem, ExtensionMessage } from '@/types';
+import { CapturedItem, ExtensionMessage, resolveUrlType } from '@/types';
+
+// 获取当前页面绝对 URL（网络或本地 file:/// 均可安全获取）
+function getCurrentPageUrl(): string {
+  return window.location.href || document.URL || location.href || 'about:blank';
+}
 
 // 注入样式
 function injectStyles() {
@@ -171,17 +176,19 @@ function initSelectionToolbar() {
     activePill.onmousedown = (e) => e.stopPropagation();
     activePill.onclick = (e) => {
       e.stopPropagation();
+      const currentUrl = getCurrentPageUrl();
       const item: CapturedItem = {
         id: `snip-${Date.now()}`,
         project: '',
         topic: '',
         title: `摘录: ${text.slice(0, 30)}...`,
-        url: window.location.href,
+        url: currentUrl,
+        urlType: resolveUrlType(currentUrl),
         sourcePlatform: 'web_article',
         capturedAt: new Date().toISOString(),
         documentType: 'snippet',
         tags: ['Snippet', 'Quote'],
-        markdownContent: `> ${text.replace(/\n+/g, '\n> ')}\n\n---\n> 来源出处: [${document.title}](${window.location.href})`,
+        markdownContent: `> ${text.replace(/\n+/g, '\n> ')}\n\n---\n> 来源出处: [${document.title || currentUrl}](${currentUrl})`,
         mediaAttachments: [],
       };
       sendSaveTask(item);
@@ -197,18 +204,21 @@ function initSelectionToolbar() {
 
 // 检查并初始化 AI Chat 适配器
 function initChatAdapter() {
-  const adapter = adapterRegistry.findAdapter(window.location.href);
+  const currentUrl = getCurrentPageUrl();
+  const adapter = adapterRegistry.findAdapter(currentUrl);
   if (!adapter) return;
 
   console.log(`[DSH Sensor] 检测到匹配的 AI Chat 平台: ${adapter.name}`);
 
   const handleSaveTurn = (turn: ExtractedTurn) => {
+    const itemUrl = getCurrentPageUrl();
     const item: CapturedItem = {
       id: `chat-${Date.now()}`,
       project: '',
       topic: 'AI-Chat',
       title: `${adapter.name}: ${turn.prompt.slice(0, 30)}`,
-      url: window.location.href,
+      url: itemUrl,
+      urlType: resolveUrlType(itemUrl),
       sourcePlatform: adapter.id as any,
       capturedAt: new Date().toISOString(),
       documentType: 'chat_turn',
@@ -244,6 +254,7 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
   }
 
   if (message.type === 'CAPTURE_FULL_PAGE') {
+    const currentUrl = getCurrentPageUrl();
     parseCurrentPageArticle(document)
       .then(article => {
         const item: CapturedItem = {
@@ -251,7 +262,8 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
           project: '',
           topic: '',
           title: article.title,
-          url: window.location.href,
+          url: currentUrl,
+          urlType: resolveUrlType(currentUrl),
           sourcePlatform: 'web_article',
           capturedAt: new Date().toISOString(),
           documentType: 'article',
@@ -273,17 +285,19 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
     const payload = message.payload as { text?: string };
     const text = payload?.text || window.getSelection()?.toString() || '';
     if (text) {
+      const currentUrl = getCurrentPageUrl();
       const item: CapturedItem = {
         id: `snip-${Date.now()}`,
         project: '',
         topic: '',
         title: `摘录: ${text.slice(0, 30)}...`,
-        url: window.location.href,
+        url: currentUrl,
+        urlType: resolveUrlType(currentUrl),
         sourcePlatform: 'web_article',
         capturedAt: new Date().toISOString(),
         documentType: 'snippet',
         tags: ['Snippet', 'Quote'],
-        markdownContent: `> ${text.replace(/\n+/g, '\n> ')}\n\n---\n> 来源出处: [${document.title}](${window.location.href})`,
+        markdownContent: `> ${text.replace(/\n+/g, '\n> ')}\n\n---\n> 来源出处: [${document.title || currentUrl}](${currentUrl})`,
         mediaAttachments: [],
       };
       sendSaveTask(item);
@@ -294,12 +308,14 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
   if (message.type === 'CAPTURE_VIDEO_CUE' as any) {
     const videoData = captureVideoCue();
     if (videoData) {
+      const currentUrl = videoData.url || getCurrentPageUrl();
       const item: CapturedItem = {
         id: `vid-${Date.now()}`,
         project: '',
         topic: 'Video',
         title: videoData.title || '视频线索',
-        url: videoData.url || window.location.href,
+        url: currentUrl,
+        urlType: resolveUrlType(currentUrl),
         sourcePlatform: videoData.sourcePlatform || 'bilibili',
         capturedAt: new Date().toISOString(),
         documentType: 'media',
@@ -330,7 +346,8 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
   }
 
   if (message.type === 'CAPTURE_CHAT_SESSION') {
-    const adapter = adapterRegistry.findAdapter(window.location.href);
+    const currentUrl = getCurrentPageUrl();
+    const adapter = adapterRegistry.findAdapter(currentUrl);
     if (adapter) {
       const session = adapter.extractSession();
       if (session) {
@@ -339,7 +356,8 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
           project: '',
           topic: 'AI-Chat',
           title: session.title,
-          url: window.location.href,
+          url: currentUrl,
+          urlType: resolveUrlType(currentUrl),
           sourcePlatform: adapter.id as any,
           capturedAt: new Date().toISOString(),
           documentType: 'chat_session',

@@ -1,4 +1,4 @@
-import { CapturedItem, ScreenshotMetadata } from '@/types';
+import { CapturedItem, ScreenshotMetadata, resolveUrlType } from '@/types';
 
 export type OnSaveCallback = (
   item: CapturedItem,
@@ -401,15 +401,16 @@ function cropAndProcessScreenshot(
         height: window.innerHeight,
       },
       pageTitle: safeTitle,
-      pageUrl: window.location.href,
+      pageUrl: window.location.href || document.URL || location.href || 'about:blank',
       visualAnnotation: userAnnotation || '用户框选的网页重点截图快照',
       agentInstruction: '【DSH 智能体提示】本线索为多模态网页图像截图快照，附件位于 assets/ 目录。包含截取区域坐标与来源上下文。请下游智能体使用视觉多模态模型(Vision LLM)分析图中布局、图表、UI或文字内容。',
     };
 
+    const currentUrl = window.location.href || document.URL || location.href || 'about:blank';
     const markdown = `# 📸 网页截图快照: ${safeTitle}
 
 > 🏷️ **模态类型**: 视觉图像快照 (Visual Screenshot)
-> 🌐 **来源地址**: [${window.location.href}](${window.location.href})
+> 🌐 **来源地址**: [${currentUrl}](${currentUrl})
 > ⏰ **截取时刻**: ${new Date().toLocaleString()}
 > 📐 **裁剪分辨率**: ${Math.round(crop.width)} × ${Math.round(crop.height)} px (DPR: ${window.devicePixelRatio || 1})
 ${userAnnotation ? `> 📝 **视觉数据标注**: ${userAnnotation}\n` : ''}
@@ -425,7 +426,8 @@ ${userAnnotation ? `> 📝 **视觉数据标注**: ${userAnnotation}\n` : ''}
       project: '',
       topic: 'Screenshots',
       title: `[截图快照] ${safeTitle.slice(0, 35)}`,
-      url: window.location.href,
+      url: currentUrl,
+      urlType: resolveUrlType(currentUrl),
       sourcePlatform: 'web_article',
       capturedAt: new Date().toISOString(),
       documentType: 'screenshot',
@@ -437,7 +439,7 @@ ${userAnnotation ? `> 📝 **视觉数据标注**: ${userAnnotation}\n` : ''}
         {
           id: `att-snap-${timestamp}`,
           type: 'image',
-          originalUrl: window.location.href,
+          originalUrl: currentUrl,
           filename: filename,
           localPath: `assets/${filename}`,
           blobDataUrl: croppedDataUrl,

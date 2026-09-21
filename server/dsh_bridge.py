@@ -44,13 +44,28 @@ class MediaAttachmentModel(BaseModel):
     blobDataUrl: Optional[str] = None
     sha256: Optional[str] = None
 
+def resolve_url_type(url: Optional[str]) -> str:
+    if not url:
+        return "local_note"
+    u = url.strip()
+    if u.startswith("file://") or re.match(r"^[a-zA-Z]:[\\/]", u):
+        return "local_file"
+    if u.startswith("http://localhost") or u.startswith("http://127.0.0.1"):
+        return "local_app"
+    if u.startswith("local://") or u.startswith("dsh://"):
+        return "local_note"
+    if u.startswith("http://") or u.startswith("https://"):
+        return "web"
+    return "web"
+
 class CapturedItemModel(BaseModel):
     id: str
     project: str
     topic: str
     topics: Optional[List[str]] = None
     title: str
-    url: str
+    url: Optional[str] = ""
+    urlType: Optional[str] = None
     sourcePlatform: str
     capturedAt: str
     documentType: str
@@ -161,6 +176,12 @@ def save_bundle(payload: SaveBundleRequest):
         with open(md_file, "w", encoding="utf-8") as f:
             f.write(item.markdownContent)
 
+        # 强制确保 URL 存在且非空，并解析 url_type
+        raw_url = (item.url or "").strip()
+        if not raw_url:
+            raw_url = f"local://dsh/capture/{item.id}"
+        url_type = item.urlType or resolve_url_type(raw_url)
+
         # 3. 写入 metadata.json
         meta_dict = {
             "id": item.id,
@@ -168,7 +189,8 @@ def save_bundle(payload: SaveBundleRequest):
             "topic": item.topic,
             "topics": item.topics or [item.topic],
             "title": item.title,
-            "url": item.url,
+            "url": raw_url,
+            "url_type": url_type,
             "source_platform": item.sourcePlatform,
             "captured_at": item.capturedAt,
             "document_type": item.documentType,

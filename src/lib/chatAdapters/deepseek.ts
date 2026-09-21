@@ -53,7 +53,8 @@ export class DeepSeekChatAdapter implements IChatAdapter {
       }
 
       // 4. 格式化组装 Markdown
-      let markdown = `### ❓ Prompt\n\n${prompt}\n\n`;
+      const currentUrl = (typeof window !== 'undefined' ? window.location.href : '') || 'https://chat.deepseek.com';
+      let markdown = `# 🤖 DeepSeek 对话轮次\n\n> 🌐 **来源地址**: [${currentUrl}](${currentUrl})\n> ⏰ **抓取时刻**: ${new Date().toLocaleString()}\n> 🏷️ **模型**: DeepSeek-V3 / R1\n\n---\n\n### ❓ Prompt\n\n${prompt}\n\n`;
       if (thinking) {
         markdown += `<details>\n<summary>🧠 思考过程 (DeepSeek Thinking)</summary>\n\n${thinking}\n\n</details>\n\n`;
       }

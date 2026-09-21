@@ -40,7 +40,8 @@ export class ChatGPTAdapter implements IChatAdapter {
         thinking = thoughtEl.textContent?.trim() || '';
       }
 
-      let markdown = `### ❓ Prompt\n\n${prompt}\n\n`;
+      const currentUrl = (typeof window !== 'undefined' ? window.location.href : '') || 'https://chatgpt.com';
+      let markdown = `# 💬 ChatGPT 对话轮次\n\n> 🌐 **来源地址**: [${currentUrl}](${currentUrl})\n> ⏰ **抓取时刻**: ${new Date().toLocaleString()}\n> 🏷️ **模型**: ChatGPT (OpenAI)\n\n---\n\n### ❓ Prompt\n\n${prompt}\n\n`;
       if (thinking) {
         markdown += `<details>\n<summary>🧠 ChatGPT 思考过程 (Thought Chain)</summary>\n\n${thinking}\n\n</details>\n\n`;
       }

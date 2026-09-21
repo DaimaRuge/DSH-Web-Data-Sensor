@@ -47,22 +47,24 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   } else if (info.menuItemId === 'dsh-capture-screenshot') {
     chrome.tabs.sendMessage(tab.id, { type: 'START_SCREENSHOT_CAPTURE' });
   } else if (info.menuItemId === 'dsh-capture-image') {
+    const pageUrl = tab.url || info.pageUrl || info.frameUrl || info.srcUrl || 'local://image-asset';
+    const originalSrc = info.srcUrl || '';
     const item: CapturedItem = {
       id: `img-${Date.now()}`,
       project: '',
       topic: '',
       title: `图片素材: ${tab.title || '网页图片'}`,
-      url: tab.url || '',
+      url: pageUrl,
       sourcePlatform: 'web_article',
       capturedAt: new Date().toISOString(),
       documentType: 'media',
       tags: ['Image', 'Asset'],
-      markdownContent: `![${tab.title || 'image'}](${info.srcUrl})\n\n> 来源: ${tab.url}`,
+      markdownContent: `![${tab.title || 'image'}](${originalSrc})\n\n> 🌐 **来源页面**: [${pageUrl}](${pageUrl})\n> 🖼️ **原图地址**: ${originalSrc || '未知'}\n> ⏰ **抓取时刻**: ${new Date().toLocaleString()}`,
       mediaAttachments: [
         {
           id: `att-${Date.now()}`,
           type: 'image',
-          originalUrl: info.srcUrl || '',
+          originalUrl: originalSrc,
           filename: `img_${Date.now()}.png`,
           localPath: `assets/img_${Date.now()}.png`,
         },

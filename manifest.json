@@ -21,7 +21,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": ["<all_urls>", "file:///*"],
       "js": ["src/content/index.ts"],
       "run_at": "document_end"
     }
@@ -35,6 +35,7 @@
     "contextMenus"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "file:///*"
   ]
 }

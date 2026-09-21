@@ -22,11 +22,12 @@ export class GeminiChatAdapter implements IChatAdapter {
         prompt = prevUser.textContent?.trim() || prompt;
       }
 
+      const currentUrl = (typeof window !== 'undefined' ? window.location.href : '') || 'https://gemini.google.com';
       return {
         prompt,
         answer,
         modelName: 'Google Gemini',
-        markdown: `### ❓ Prompt\n\n${prompt}\n\n### 💡 Gemini 回答\n\n${answer}\n\n`,
+        markdown: `# ✨ Gemini 对话轮次\n\n> 🌐 **来源地址**: [${currentUrl}](${currentUrl})\n> ⏰ **抓取时刻**: ${new Date().toLocaleString()}\n> 🏷️ **模型**: Google Gemini\n\n---\n\n### ❓ Prompt\n\n${prompt}\n\n### 💡 Gemini 回答\n\n${answer}\n\n`,
       };
     } catch {
       return null;
@@ -99,11 +100,12 @@ export class DoubaoChatAdapter implements IChatAdapter {
 
   extractTurn(turnEl: HTMLElement): ExtractedTurn | null {
     const answer = htmlToMarkdown(turnEl.innerHTML).trim();
+    const currentUrl = (typeof window !== 'undefined' ? window.location.href : '') || 'https://www.doubao.com';
     return {
       prompt: '豆包对话提问',
       answer,
       modelName: 'Doubao',
-      markdown: `### 💡 豆包回答\n\n${answer}\n\n`,
+      markdown: `# 🌰 豆包对话轮次\n\n> 🌐 **来源地址**: [${currentUrl}](${currentUrl})\n> ⏰ **抓取时刻**: ${new Date().toLocaleString()}\n> 🏷️ **模型**: Doubao\n\n---\n\n### 💡 豆包回答\n\n${answer}\n\n`,
     };
   }
 
@@ -116,11 +118,12 @@ export class DoubaoChatAdapter implements IChatAdapter {
       return turn;
     });
 
+    const currentUrl = (typeof window !== 'undefined' ? window.location.href : '') || 'https://www.doubao.com';
     return {
       title: document.title || '豆包对话记录',
       modelName: 'Doubao',
       turns,
-      markdown: `# 豆包对话归档\n\n` + turns.map(t => t.markdown).join('\n---\n'),
+      markdown: `# 豆包对话归档\n\n> 🌐 **来源地址**: [${currentUrl}](${currentUrl})\n> ⏰ **归档时间**: ${new Date().toLocaleString()}\n\n---\n\n` + turns.map(t => t.markdown).join('\n---\n'),
     };
   }
 
@@ -155,11 +158,12 @@ export class GrokChatAdapter implements IChatAdapter {
 
   extractTurn(turnEl: HTMLElement): ExtractedTurn | null {
     const answer = htmlToMarkdown(turnEl.innerHTML).trim();
+    const currentUrl = (typeof window !== 'undefined' ? window.location.href : '') || 'https://grok.com';
     return {
       prompt: 'Grok 提问',
       answer,
       modelName: 'xAI Grok',
-      markdown: `### 💡 Grok 回答\n\n${answer}\n\n`,
+      markdown: `# ⚡ Grok 对话轮次\n\n> 🌐 **来源地址**: [${currentUrl}](${currentUrl})\n> ⏰ **抓取时刻**: ${new Date().toLocaleString()}\n> 🏷️ **模型**: xAI Grok\n\n---\n\n### 💡 Grok 回答\n\n${answer}\n\n`,
     };
   }
 
@@ -172,11 +176,12 @@ export class GrokChatAdapter implements IChatAdapter {
       return turn;
     });
 
+    const currentUrl = (typeof window !== 'undefined' ? window.location.href : '') || 'https://grok.com';
     return {
       title: document.title || 'Grok 对话记录',
       modelName: 'xAI Grok',
       turns,
-      markdown: `# Grok 对话记录\n\n` + turns.map(t => t.markdown).join('\n---\n'),
+      markdown: `# Grok 对话归档\n\n> 🌐 **来源地址**: [${currentUrl}](${currentUrl})\n> ⏰ **归档时间**: ${new Date().toLocaleString()}\n\n---\n\n` + turns.map(t => t.markdown).join('\n---\n'),
     };
   }
 

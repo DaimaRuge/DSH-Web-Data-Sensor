@@ -13,6 +13,7 @@ export type SourcePlatform =
   | 'bilibili' 
   | 'youtube' 
   | 'pdf' 
+  | 'local_file'
   | 'other';
 
 export type DocumentType = 
@@ -69,6 +70,7 @@ export interface CapturedItem {
   topics?: string[];
   title: string;
   url: string;
+  urlType?: 'web' | 'local_file' | 'local_app' | 'local_note';
   sourcePlatform: SourcePlatform;
   capturedAt: string; // ISO 8601
   documentType: DocumentType;
@@ -179,4 +181,25 @@ export interface TelemetryInsights {
   frequentProjects: { projectId: string; projectName: string; count: number; lastUsed: string }[];
   frequentTopics: { topic: string; count: number }[];
   suggestedTopicsForCurrentDomain?: string[];
+}
+
+/**
+ * 识别并归类 URL 模态与来源类型
+ */
+export function resolveUrlType(url?: string): 'web' | 'local_file' | 'local_app' | 'local_note' {
+  if (!url) return 'local_note';
+  const trimmed = url.trim();
+  if (trimmed.startsWith('file://') || /^[a-zA-Z]:[\\/]/.test(trimmed)) {
+    return 'local_file';
+  }
+  if (trimmed.startsWith('http://localhost') || trimmed.startsWith('http://127.0.0.1')) {
+    return 'local_app';
+  }
+  if (trimmed.startsWith('local://') || trimmed.startsWith('dsh://')) {
+    return 'local_note';
+  }
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    return 'web';
+  }
+  return 'web';
 }

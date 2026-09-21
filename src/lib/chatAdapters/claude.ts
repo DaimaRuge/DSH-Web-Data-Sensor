@@ -42,7 +42,8 @@ export class ClaudeChatAdapter implements IChatAdapter {
         prompt = 'Claude 提问';
       }
 
-      let markdown = `### ❓ Prompt\n\n${prompt}\n\n`;
+      const currentUrl = (typeof window !== 'undefined' ? window.location.href : '') || 'https://claude.ai';
+      let markdown = `# 🧠 Claude 对话轮次\n\n> 🌐 **来源地址**: [${currentUrl}](${currentUrl})\n> ⏰ **抓取时刻**: ${new Date().toLocaleString()}\n> 🏷️ **模型**: Claude 3.5 / 3.7\n\n---\n\n### ❓ Prompt\n\n${prompt}\n\n`;
       if (thinking) {
         markdown += `<details>\n<summary>🧠 Claude 扩展思考过程 (Extended Thinking)</summary>\n\n${thinking}\n\n</details>\n\n`;
       }

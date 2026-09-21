@@ -39,8 +39,9 @@ export async function parseCurrentPageArticle(doc: Document, downloadImages = tr
   let markdown = htmlToMarkdown(rawHtml);
   markdown = replaceMarkdownImageUrls(markdown, urlMap);
 
-  // 拼接元数据头部
-  const header = `# ${title}\n\n> 来源: [${doc.location.href}](${doc.location.href})\n> 抓取时间: ${new Date().toLocaleString()}\n${byline ? `> 作者: ${byline}\n` : ''}\n---\n\n`;
+  // 拼接元数据头部（保证包含规范的来源地址）
+  const pageUrl = doc.location?.href || (typeof window !== 'undefined' ? window.location.href : '') || 'about:blank';
+  const header = `# ${title}\n\n> 🌐 **来源地址**: [${pageUrl}](${pageUrl})\n> ⏰ **抓取时间**: ${new Date().toLocaleString()}\n${byline ? `> ✍️ **作者**: ${byline}\n` : ''}\n---\n\n`;
 
   return {
     title,
