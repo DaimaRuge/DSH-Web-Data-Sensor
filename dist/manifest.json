@@ -22,7 +22,7 @@
   "content_scripts": [
     {
       "js": [
-        "assets/index.ts-loader-DYqrkT5V.js"
+        "assets/index.ts-loader-9tHJ28tn.js"
       ],
       "matches": [
         "<all_urls>",
@@ -37,7 +37,8 @@
     "downloads",
     "activeTab",
     "scripting",
-    "contextMenus"
+    "contextMenus",
+    "tabs"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -51,7 +52,7 @@
       ],
       "resources": [
         "assets/index-K1G2e5ai.js",
-        "assets/index.ts-CywaZl4k.js"
+        "assets/index.ts-IYTjQPAv.js"
       ],
       "use_dynamic_url": false
     }

@@ -7,32 +7,48 @@ export type OnSaveCallback = (
 
 export function startInteractiveScreenshot(
   onSave: OnSaveCallback,
-  onError: (err: string) => void
+  onError: (err: string) => void,
+  defaultProject?: string,
+  defaultTopics?: string[]
 ) {
   // 1. 向 background 请求截取当前可视区域
   chrome.runtime.sendMessage({ type: 'CAPTURE_VISIBLE_TAB_REQUEST' }, (response) => {
-    if (!response || !response.success || !response.dataUrl) {
-      onError(response?.error || '截取当前可视区域失败');
+    if (chrome.runtime.lastError || !response || !response.success || !response.dataUrl) {
+      const errMsg = response?.error || chrome.runtime.lastError?.message || '截取当前可视区域失败';
+      onError(errMsg);
       return;
     }
 
-    renderCropperOverlay(response.dataUrl, onSave);
+    renderCropperOverlay(response.dataUrl, onSave, defaultProject, defaultTopics);
   });
 }
 
-function renderCropperOverlay(fullScreenshotUrl: string, onSave: OnSaveCallback) {
+function renderCropperOverlay(
+  fullScreenshotUrl: string,
+  onSave: OnSaveCallback,
+  defaultProject?: string,
+  defaultTopics?: string[]
+) {
   const existing = document.getElementById('dsh-cropper-overlay');
-  if (existing) existing.remove();
+  if (existing) {
+    existing.remove();
+    (window as any).__dsh_cropper_cleanup?.();
+  }
 
   const overlay = document.createElement('div');
   overlay.id = 'dsh-cropper-overlay';
   overlay.style.cssText = `
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh;
-    z-index: 2147483647;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+    z-index: 2147483647 !important;
     cursor: crosshair;
     user-select: none;
     background: rgba(15, 23, 42, 0.45);
@@ -210,7 +226,9 @@ function renderCropperOverlay(fullScreenshotUrl: string, onSave: OnSaveCallback)
   const cleanup = () => {
     overlay.remove();
     document.removeEventListener('keydown', handleKeyDown);
+    (window as any).__dsh_cropper_cleanup = undefined;
   };
+  (window as any).__dsh_cropper_cleanup = cleanup;
 
   overlay.addEventListener('mousedown', (e) => {
     if (actionPanel.contains(e.target as Node)) return;
@@ -320,7 +338,9 @@ function renderCropperOverlay(fullScreenshotUrl: string, onSave: OnSaveCallback)
             statusTip.textContent = `❌ 保存失败: ${res.error || '未能成功写入磁盘'}`;
           }
         }
-      }
+      },
+      defaultProject,
+      defaultTopics
     );
   };
 
@@ -348,7 +368,10 @@ function renderCropperOverlay(fullScreenshotUrl: string, onSave: OnSaveCallback)
   };
   document.addEventListener('keydown', handleKeyDown);
 
-  document.body.appendChild(overlay);
+  const mountTarget = document.documentElement || document.body;
+  if (mountTarget) {
+    mountTarget.appendChild(overlay);
+  }
 }
 
 function cropAndProcessScreenshot(
@@ -356,18 +379,22 @@ function cropAndProcessScreenshot(
   crop: { x: number; y: number; width: number; height: number },
   userAnnotation: string,
   onSave: OnSaveCallback,
-  onComplete: (res: { success: boolean; error?: string; savedPath?: string }) => void
+  onComplete: (res: { success: boolean; error?: string; savedPath?: string }) => void,
+  defaultProject?: string,
+  defaultTopics?: string[]
 ) {
   const img = new Image();
   img.onload = () => {
-    // 处理 High DPI (Retina / 缩放屏幕)
-    const scaleX = img.naturalWidth / window.innerWidth;
-    const scaleY = img.naturalHeight / window.innerHeight;
+    // 处理 High DPI (Retina / 缩放屏幕) 并提供安全视口降级
+    const viewWidth = window.innerWidth || document.documentElement.clientWidth || 1;
+    const viewHeight = window.innerHeight || document.documentElement.clientHeight || 1;
+    const scaleX = img.naturalWidth / viewWidth;
+    const scaleY = img.naturalHeight / viewHeight;
 
-    const cropX = crop.x * scaleX;
-    const cropY = crop.y * scaleY;
-    const cropW = crop.width * scaleX;
-    const cropH = crop.height * scaleY;
+    const cropX = Math.max(0, crop.x * scaleX);
+    const cropY = Math.max(0, crop.y * scaleY);
+    const cropW = Math.max(1, Math.min(crop.width * scaleX, img.naturalWidth - cropX));
+    const cropH = Math.max(1, Math.min(crop.height * scaleY, img.naturalHeight - cropY));
 
     const canvas = document.createElement('canvas');
     canvas.width = cropW;
@@ -397,8 +424,8 @@ function cropAndProcessScreenshot(
         devicePixelRatio: window.devicePixelRatio || 1,
       },
       viewport: {
-        width: window.innerWidth,
-        height: window.innerHeight,
+        width: viewWidth,
+        height: viewHeight,
       },
       pageTitle: safeTitle,
       pageUrl: window.location.href || document.URL || location.href || 'about:blank',
@@ -421,17 +448,19 @@ ${userAnnotation ? `> 📝 **视觉数据标注**: ${userAnnotation}\n` : ''}
 > 🤖 **Agent 视觉感知指令**: 本条目已完成多模态视觉数据标注。下游 DSH 智能体请通过 Vision 模型读取对应 \`assets/\` 附件进行图像解析、图表抽取或 OCR 识别。
 `;
 
+    const finalTopics = (defaultTopics && defaultTopics.length > 0) ? defaultTopics : ['Screenshots'];
     const item: CapturedItem = {
       id: `snap-${timestamp}`,
-      project: '',
-      topic: 'Screenshots',
+      project: defaultProject || '',
+      topic: finalTopics.join('+'),
+      topics: finalTopics,
       title: `[截图快照] ${safeTitle.slice(0, 35)}`,
       url: currentUrl,
       urlType: resolveUrlType(currentUrl),
       sourcePlatform: 'web_article',
       capturedAt: new Date().toISOString(),
       documentType: 'screenshot',
-      tags: ['Screenshot', 'VisualSnapshot', 'Multimodal'],
+      tags: ['Screenshot', 'VisualSnapshot', 'Multimodal', ...finalTopics],
       userNotes: userAnnotation,
       markdownContent: markdown,
       screenshotMetadata: screenshotMeta,

@@ -93,44 +93,54 @@ export default function App() {
   const refreshActiveTab = useCallback(async (): Promise<{ id?: number; title?: string; url?: string }> => {
     return new Promise((resolve) => {
       if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query) {
+        const processTab = (tab: chrome.tabs.Tab) => {
+          const tabInfo = {
+            id: tab.id,
+            title: tab.title || '当前标签页',
+            url: tab.url || 'about:blank',
+          };
+          setActiveTab(tabInfo);
+
+          if (tab.url) {
+            try {
+              const domain = tab.url.startsWith('file://') ? 'local_file' : (new URL(tab.url).hostname || 'local');
+              fetchTelemetryInsights(domain).then(insights => {
+                if (insights) {
+                  if (insights.suggestedTopicsForCurrentDomain) {
+                    setSuggestedTopics(insights.suggestedTopicsForCurrentDomain);
+                  }
+                  if (insights.frequentParentDirs && insights.frequentParentDirs.length > 0) {
+                    setFrequentParentDirs(insights.frequentParentDirs);
+                    setParentScanDir(prev => prev || insights.frequentParentDirs[0]);
+                  }
+                }
+              });
+
+              trackEvent({
+                eventType: 'page_view',
+                projectId: settings.activeProjectId,
+                url: tab.url,
+                domain,
+                pageTitle: tab.title,
+              }).catch(() => {});
+            } catch {}
+          }
+          resolve(tabInfo);
+        };
+
         chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
           if (tabs && tabs[0]) {
-            const tab = tabs[0];
-            const tabInfo = {
-              id: tab.id,
-              title: tab.title || '当前标签页',
-              url: tab.url || 'about:blank',
-            };
-            setActiveTab(tabInfo);
-
-            if (tab.url) {
-              try {
-                const domain = tab.url.startsWith('file://') ? 'local_file' : (new URL(tab.url).hostname || 'local');
-                fetchTelemetryInsights(domain).then(insights => {
-                  if (insights) {
-                    if (insights.suggestedTopicsForCurrentDomain) {
-                      setSuggestedTopics(insights.suggestedTopicsForCurrentDomain);
-                    }
-                    if (insights.frequentParentDirs && insights.frequentParentDirs.length > 0) {
-                      setFrequentParentDirs(insights.frequentParentDirs);
-                      setParentScanDir(prev => prev || insights.frequentParentDirs[0]);
-                    }
-                  }
-                });
-
-                trackEvent({
-                  eventType: 'page_view',
-                  projectId: settings.activeProjectId,
-                  url: tab.url,
-                  domain,
-                  pageTitle: tab.title,
-                }).catch(() => {});
-              } catch {}
-            }
-            resolve(tabInfo);
+            processTab(tabs[0]);
             return;
           }
-          resolve({});
+          // 回退使用 lastFocusedWindow，保证在 SidePanel 聚焦时也能获取浏览窗口活跃 Tab
+          chrome.tabs.query({ active: true, lastFocusedWindow: true }, (fallbackTabs) => {
+            if (fallbackTabs && fallbackTabs[0]) {
+              processTab(fallbackTabs[0]);
+              return;
+            }
+            resolve({});
+          });
         });
       } else {
         resolve({});
@@ -361,6 +371,48 @@ export default function App() {
     }, 600);
   };
 
+  // 检测是否为受浏览器严格安全保护而无法注入脚本的页面
+  const isRestrictedUrl = (url?: string): boolean => {
+    if (!url) return false;
+    return (
+      url.startsWith('chrome://') ||
+      url.startsWith('edge://') ||
+      url.startsWith('about:') ||
+      url.startsWith('chrome-extension://') ||
+      url.startsWith('devtools://') ||
+      url.startsWith('view-source:') ||
+      url.includes('chromewebstore.google.com')
+    );
+  };
+
+  // 确保目标标签页已准备好 Content Script，若因此前已打开而未加载则自动动态注入
+  const ensureContentScript = async (tabId: number): Promise<boolean> => {
+    return new Promise((resolve) => {
+      chrome.tabs.sendMessage(tabId, { type: 'PING' }, async (res) => {
+        if (!chrome.runtime.lastError && res?.pong) {
+          resolve(true);
+          return;
+        }
+        // 尝试通过 chrome.scripting 动态注入
+        try {
+          const manifest = chrome.runtime.getManifest();
+          const scripts = manifest.content_scripts?.[0]?.js;
+          if (scripts && scripts.length > 0) {
+            await chrome.scripting.executeScript({
+              target: { tabId },
+              files: scripts,
+            });
+            setTimeout(() => resolve(true), 150);
+            return;
+          }
+        } catch (err) {
+          console.warn('动态注入 Content Script 异常:', err);
+        }
+        resolve(false);
+      });
+    });
+  };
+
   // 1-Click 抓取网页正文
   const handleCaptureCurrentPage = async () => {
     const curTab = await refreshActiveTab();
@@ -368,7 +420,12 @@ export default function App() {
       showToast('未检测到活跃标签页', true);
       return;
     }
+    if (isRestrictedUrl(curTab.url)) {
+      showToast('浏览器安全限制：无法在内部系统页或应用商店中抓取', true);
+      return;
+    }
     setIsProcessing(true);
+    await ensureContentScript(curTab.id);
     chrome.tabs.sendMessage(curTab.id, { type: 'CAPTURE_FULL_PAGE' }, (response) => {
       setIsProcessing(false);
       if (response && response.success) {
@@ -376,7 +433,7 @@ export default function App() {
         loadData();
       } else {
         const isLocal = curTab.url?.startsWith('file://');
-        const hint = isLocal ? '（提示：检测到本地 file:/// 文件，若尚未注入，请在 chrome://extensions 详情中开启“允许访问文件网址”）' : '';
+        const hint = isLocal ? '（提示：本地 file:/// 文件需在 chrome://extensions 详情中开启“允许访问文件网址”）' : '';
         showToast(`抓取遇到问题: ${response?.error || '页面可能未完全加载'}${hint}`, true);
       }
     });
@@ -389,7 +446,12 @@ export default function App() {
       showToast('未检测到活跃标签页', true);
       return;
     }
+    if (isRestrictedUrl(curTab.url)) {
+      showToast('浏览器安全限制：无法在内部系统页中归档', true);
+      return;
+    }
     setIsProcessing(true);
+    await ensureContentScript(curTab.id);
     chrome.tabs.sendMessage(curTab.id, { type: 'CAPTURE_CHAT_SESSION' }, (response) => {
       setIsProcessing(false);
       if (response && response.success) {
@@ -408,7 +470,12 @@ export default function App() {
       showToast('未检测到活跃标签页', true);
       return;
     }
+    if (isRestrictedUrl(curTab.url)) {
+      showToast('浏览器安全限制：无法在内部系统页中抓取视频', true);
+      return;
+    }
     setIsProcessing(true);
+    await ensureContentScript(curTab.id);
     chrome.tabs.sendMessage(curTab.id, { type: 'CAPTURE_VIDEO_CUE' as any }, (response) => {
       setIsProcessing(false);
       if (response && response.success) {
@@ -427,13 +494,32 @@ export default function App() {
       showToast('未检测到活跃标签页', true);
       return;
     }
-    chrome.tabs.sendMessage(curTab.id, { type: 'START_SCREENSHOT_CAPTURE' }, () => {
-      if (chrome.runtime.lastError) {
-        const isLocal = curTab.url?.startsWith('file://');
-        const hint = isLocal ? '。本地 file:/// 文件需在扩展管理中勾选【允许访问文件网址】' : '，请刷新目标页面重试';
-        showToast(`唤起截图失败${hint}`, true);
+
+    if (isRestrictedUrl(curTab.url)) {
+      showToast('浏览器安全限制：无法在内部系统页或应用商店中截图，请在常规网页或本地文件中使用', true);
+      return;
+    }
+
+    // 自动检测并注入 Content Script，确保即使是扩展加载前打开的页面也能立即启动截图
+    await ensureContentScript(curTab.id);
+
+    chrome.tabs.sendMessage(
+      curTab.id,
+      {
+        type: 'START_SCREENSHOT_CAPTURE',
+        payload: {
+          project: activeProject.name,
+          topics: activeTopics,
+        },
+      },
+      () => {
+        if (chrome.runtime.lastError) {
+          const isLocal = curTab.url?.startsWith('file://');
+          const hint = isLocal ? '。本地 file:/// 文件需在扩展管理中勾选【允许访问文件网址】' : '，请刷新目标页面重试';
+          showToast(`唤起截图失败: ${chrome.runtime.lastError.message}${hint}`, true);
+        }
       }
-    });
+    );
   };
 
   // 快速提交便签/灵感

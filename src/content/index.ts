@@ -332,14 +332,22 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
     return true;
   }
 
+  if (message.type === 'PING') {
+    sendResponse({ pong: true });
+    return true;
+  }
+
   if (message.type === 'START_SCREENSHOT_CAPTURE') {
+    const payload = message.payload as { project?: string; topics?: string[] } | undefined;
     startInteractiveScreenshot(
       (item, onComplete) => {
         sendSaveTask(item, onComplete);
       },
       (err) => {
         showToast(`截图失败: ${err}`, true);
-      }
+      },
+      payload?.project,
+      payload?.topics
     );
     sendResponse({ success: true });
     return true;
