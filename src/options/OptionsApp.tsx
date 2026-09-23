@@ -59,7 +59,7 @@ export default function OptionsApp() {
       <div className="bg-white rounded-xl shadow-md border border-slate-200 overflow-hidden">
         <div className="px-6 py-4 bg-slate-900 text-white flex items-center justify-between">
           <div className="flex items-center space-x-3">
-            <img src="/icons/icon48.png" className="w-8 h-8 rounded-full object-cover shadow" alt="DSH Whale" />
+            <img src="/icons/icon48.png" className="w-8 h-8 object-contain" alt="DSH Whale" />
             <div>
               <h1 className="text-base font-semibold">DSH Web Sensor 全局设置中心</h1>
               <p className="text-xs text-slate-400">DeepSeek Harness 前端多模态数据采集与预处理插件</p>

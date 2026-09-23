@@ -757,7 +757,7 @@ export default function App() {
       {/* 顶部 Header */}
       <header className="flex items-center justify-between px-3 py-2.5 bg-slate-900 text-white border-b border-slate-800 shadow-sm">
         <div className="flex items-center space-x-2">
-          <img src="/icons/icon48.png" className="w-5 h-5 rounded-full object-cover shadow-xs" alt="DSH Whale" />
+          <img src="/icons/icon48.png" className="w-5 h-5 object-contain" alt="DSH Whale" />
           <div>
             <h1 className="font-semibold tracking-wide text-xs text-slate-100 flex items-center gap-1.5">
               DSH Web Sensor
