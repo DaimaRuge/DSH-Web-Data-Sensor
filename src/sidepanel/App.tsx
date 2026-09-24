@@ -13,6 +13,7 @@ import { checkBridgeHealth, fetchSystemEnvFromBridge, initSensorWorkspaceViaBrid
 import { getRecentCaptures, executeSaveBundle } from '@/lib/storage/bundleSaver';
 import { fetchAvailableModels } from '@/lib/ai/deepseek';
 import { trackEvent, fetchTelemetryInsights, discoverProjectsInDirectory } from '@/lib/telemetry/tracker';
+import { parseTopicsInput } from '@/lib/parser/topics';
 
 export default function App() {
   const [settings, setSettings] = useState<PluginSettings>(DEFAULT_SETTINGS);
@@ -304,14 +305,19 @@ export default function App() {
   };
 
   const handleAddTopicConfirm = async () => {
-    if (!customTopicInput.trim()) return;
-    const name = customTopicInput.trim();
+    const inputTopics = parseTopicsInput(customTopicInput);
+    if (inputTopics.length === 0) return;
+
     const currentTopics = activeProject.topics || [];
-    if (!currentTopics.includes(name)) {
-      const newTopics = [...currentTopics, name];
-      await updateProject(activeProject.id, { topics: newTopics });
+    const newTopicsToAdd = inputTopics.filter(t => !currentTopics.includes(t));
+    const allProjectTopics = [...currentTopics, ...newTopicsToAdd];
+
+    if (newTopicsToAdd.length > 0) {
+      await updateProject(activeProject.id, { topics: allProjectTopics });
     }
-    const updatedActiveTopics = activeTopics.includes(name) ? activeTopics : [...activeTopics, name];
+
+    // 自动将新输入的主题加入多选激活主题中
+    const updatedActiveTopics = Array.from(new Set([...activeTopics, ...inputTopics]));
     const updated = await saveSettings({ 
       activeTopics: updatedActiveTopics, 
       activeTopic: updatedActiveTopics[0] 
@@ -319,7 +325,22 @@ export default function App() {
     setSettings(updated);
     setCustomTopicInput('');
     setShowAddTopic(false);
-    showToast(`主题【${name}】已创建并选中`);
+
+    // 针对新主题发送行为埋点
+    for (const t of newTopicsToAdd) {
+      trackEvent({
+        eventType: 'create_topic',
+        projectId: activeProject.id,
+        projectName: activeProject.name,
+        topic: t,
+      }).catch(() => {});
+    }
+
+    if (inputTopics.length === 1) {
+      showToast(`主题【${inputTopics[0]}】已创建并选中`);
+    } else {
+      showToast(`已批量添加 ${inputTopics.length} 个主题并选中: ${inputTopics.join('、')}`);
+    }
   };
 
   // 授权本地文件夹并就绪 /dshWebSensor 子目录
@@ -596,7 +617,7 @@ export default function App() {
       showToast('请输入项目名称', true);
       return;
     }
-    const topicsArr = newProjTopics.split(/[,，]/).map(t => t.trim()).filter(Boolean);
+    const topicsArr = parseTopicsInput(newProjTopics);
     const chosenWorkspace = newProjPath.trim() || (parentScanDir ? `${parentScanDir}/${newProjName.trim()}` : `D:/KnowledgeBase/${newProjName.trim()}`);
     
     const newP: ProjectConfig = {
@@ -958,21 +979,33 @@ export default function App() {
               </div>
 
               {showAddTopic && (
-                <div className="flex gap-1 mb-2">
-                  <input 
-                    type="text" 
-                    placeholder="输入新主题名称..." 
-                    value={customTopicInput}
-                    onChange={(e) => setCustomTopicInput(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleAddTopicConfirm()}
-                    className="flex-1 bg-white border border-slate-200 rounded px-2 py-1 text-xs focus:border-emerald-500 focus:outline-none"
-                  />
-                  <button 
-                    onClick={handleAddTopicConfirm}
-                    className="px-2 py-1 bg-emerald-600 text-white rounded text-xs hover:bg-emerald-700"
-                  >
-                    添加并选中
-                  </button>
+                <div className="space-y-1 mb-2">
+                  <div className="flex gap-1">
+                    <input 
+                      type="text" 
+                      placeholder="输入主题 (支持空格、中英文逗号多选输入)..." 
+                      value={customTopicInput}
+                      onChange={(e) => setCustomTopicInput(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleAddTopicConfirm()}
+                      className="flex-1 bg-white border border-slate-200 rounded px-2 py-1 text-xs focus:border-emerald-500 focus:outline-none"
+                    />
+                    <button 
+                      onClick={handleAddTopicConfirm}
+                      className="px-2 py-1 bg-emerald-600 text-white rounded text-xs hover:bg-emerald-700 font-medium shrink-0"
+                    >
+                      添加并选中
+                    </button>
+                  </div>
+                  {parseTopicsInput(customTopicInput).length > 1 && (
+                    <div className="flex flex-wrap items-center gap-1 text-[10px] text-slate-500 pt-0.5">
+                      <span>将识别为 {parseTopicsInput(customTopicInput).length} 个主题:</span>
+                      {parseTopicsInput(customTopicInput).map(t => (
+                        <span key={t} className="px-1.5 py-0.5 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded text-[9px] font-medium">
+                          +{t}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1267,13 +1300,26 @@ export default function App() {
               </div>
             </div>
             <div>
-              <label className="text-[10px] text-slate-500">默认主题 (逗号分隔)</label>
+              <div className="flex items-center justify-between mb-0.5">
+                <label className="text-[10px] text-slate-500 font-medium">默认主题 / 预设标签 (支持空格、中英文逗号间隔)</label>
+                <span className="text-[9px] text-slate-400">已识别 {parseTopicsInput(newProjTopics).length} 个</span>
+              </div>
               <input 
                 type="text"
+                placeholder="例如: 架构 算法 笔记 (空格或逗号均可)"
                 value={newProjTopics}
                 onChange={(e) => setNewProjTopics(e.target.value)}
                 className="w-full p-1.5 mt-0.5 bg-slate-50 border border-slate-200 rounded text-xs focus:bg-white focus:border-emerald-500 focus:outline-none"
               />
+              {parseTopicsInput(newProjTopics).length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-1.5 max-h-16 overflow-y-auto">
+                  {parseTopicsInput(newProjTopics).map(t => (
+                    <span key={t} className="px-1.5 py-0.5 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded text-[10px] flex items-center gap-0.5">
+                      <span className="text-emerald-500 font-bold">#</span>{t}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
             <button 
               onClick={handleCreateProject}
