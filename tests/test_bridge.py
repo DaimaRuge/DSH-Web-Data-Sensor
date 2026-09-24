@@ -336,6 +336,63 @@ def test_captured_item_url_guarantee_and_types():
 
         print("[Test Pass] 成功验证公网 URL、本地文件 file:///、localhost 以及兜底 URL 100% 具备有效 URL 与正确的 url_type！")
 
+def test_downloaded_file_bundle_with_tags_and_metadata():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fake_pdf_content = b"%PDF-1.7 Fake PDF Binary Content For DSH Download Test"
+        fake_pdf_base64 = "data:application/pdf;base64," + base64.b64encode(fake_pdf_content).decode()
+
+        payload = {
+            "workspace_path": tmpdir,
+            "item": {
+                "id": "file-test-8801",
+                "project": "AI-Research-2026",
+                "topic": "DeepSeek+Architecture",
+                "topics": ["DeepSeek", "Architecture"],
+                "title": "[文件] DeepSeek_V3_Technical_Report.pdf",
+                "url": "https://arxiv.org/pdf/2412.19437.pdf",
+                "sourcePlatform": "other",
+                "capturedAt": "2026-09-24T16:30:00+08:00",
+                "documentType": "file",
+                "tags": ["Download", "File", "PDF", "DeepSeek", "Architecture"],
+                "markdownContent": "# 📁 文件下载索引: DeepSeek_V3_Technical_Report.pdf\n\n> 来源: [2412.19437.pdf](https://arxiv.org/pdf/2412.19437.pdf)\n> 归属主题: DeepSeek、Architecture",
+                "mediaAttachments": [
+                    {
+                        "id": "att-file-01",
+                        "type": "file",
+                        "originalUrl": "https://arxiv.org/pdf/2412.19437.pdf",
+                        "filename": "DeepSeek_V3_Technical_Report.pdf",
+                        "localPath": "assets/DeepSeek_V3_Technical_Report.pdf",
+                        "blobDataUrl": fake_pdf_base64
+                    }
+                ]
+            }
+        }
+
+        response = client.post("/api/save_bundle", json=payload)
+        assert response.status_code == 200
+        res_data = response.json()
+        assert res_data["success"] is True
+
+        saved_path = Path(res_data["saved_path"])
+        assert "dshWebSensor" in str(saved_path)
+        assert (saved_path / "metadata.json").exists()
+        assert (saved_path / "content.md").exists()
+        assert (saved_path / "assets" / "DeepSeek_V3_Technical_Report.pdf").exists()
+
+        # 验证物理文件内容无损写入
+        saved_bytes = (saved_path / "assets" / "DeepSeek_V3_Technical_Report.pdf").read_bytes()
+        assert saved_bytes == fake_pdf_content
+
+        # 验证 metadata.json 中的标签与主题索引
+        meta = json.loads((saved_path / "metadata.json").read_text(encoding="utf-8"))
+        assert meta["document_type"] == "file"
+        assert "DeepSeek" in meta["tags"]
+        assert "Architecture" in meta["tags"]
+        assert "PDF" in meta["tags"]
+        assert meta["url"] == "https://arxiv.org/pdf/2412.19437.pdf"
+
+        print(f"[Test Pass] 成功验证右键/批量文件下载、物理落盘与标签索引: {saved_path}")
+
 if __name__ == "__main__":
     test_health_check()
     test_init_sensor_workspace()
@@ -345,4 +402,6 @@ if __name__ == "__main__":
     test_discover_projects_in_parent()
     test_save_bundle_with_multi_topics()
     test_captured_item_url_guarantee_and_types()
+    test_downloaded_file_bundle_with_tags_and_metadata()
     print("\n🎉 所有后端与 Bridge 测试 100% 成功通过！")
+

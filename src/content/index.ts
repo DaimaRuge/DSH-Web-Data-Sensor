@@ -3,6 +3,7 @@ import { ExtractedTurn } from '@/lib/chatAdapters/types';
 import { parseCurrentPageArticle } from '@/lib/parser/readability';
 import { captureVideoCue } from '@/lib/chatAdapters/videoAdapter';
 import { startInteractiveScreenshot } from './screenshotCropper';
+import { scanElementForDownloadableFiles } from '@/lib/parser/fileDetector';
 import { CapturedItem, ExtensionMessage, resolveUrlType } from '@/types';
 
 // 获取当前页面绝对 URL（网络或本地 file:/// 均可安全获取）
@@ -334,6 +335,26 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
 
   if (message.type === 'PING') {
     sendResponse({ pong: true });
+    return true;
+  }
+
+  if (message.type === 'DETECT_PAGE_FILES') {
+    try {
+      const currentUrl = getCurrentPageUrl();
+      const files = scanElementForDownloadableFiles(document, currentUrl);
+      sendResponse({
+        success: true,
+        files,
+        pageTitle: document.title,
+        pageUrl: currentUrl,
+      });
+    } catch (err) {
+      sendResponse({
+        success: false,
+        error: (err as Error).message,
+        files: [],
+      });
+    }
     return true;
   }
 

@@ -24,7 +24,9 @@ export type DocumentType =
   | 'pdf' 
   | 'media' 
   | 'note'
-  | 'screenshot';
+  | 'screenshot'
+  | 'file'
+  | 'download';
 
 export interface ScreenshotMetadata {
   isScreenshot: true;
@@ -47,7 +49,7 @@ export interface ScreenshotMetadata {
 
 export interface MediaAttachment {
   id: string;
-  type: 'image' | 'video' | 'audio' | 'pdf' | 'doc';
+  type: 'image' | 'video' | 'audio' | 'pdf' | 'doc' | 'file';
   originalUrl: string;
   filename: string;
   localPath: string; // e.g. "assets/img_01_a9f2.png"
@@ -148,7 +150,11 @@ export type MessageType =
   | 'SAVE_BUNDLE'
   | 'TRIGGER_SIDE_PANEL'
   | 'SHOW_TOAST'
-  | 'ITEM_SAVED_EVENT';
+  | 'ITEM_SAVED_EVENT'
+  | 'DETECT_PAGE_FILES'
+  | 'DETECT_PAGE_FILES_RESPONSE'
+  | 'OPEN_DOWNLOAD_PANEL'
+  | 'BATCH_DOWNLOAD_PROGRESS';
 
 export interface ExtensionMessage<T = unknown> {
   type: MessageType;
@@ -161,7 +167,9 @@ export type TelemetryEventType =
   | 'switch_topic'
   | 'create_project'
   | 'create_topic'
-  | 'page_view';
+  | 'page_view'
+  | 'download_file'
+  | 'batch_download_files';
 
 export interface TelemetryEvent {
   eventId: string;
@@ -203,3 +211,6 @@ export function resolveUrlType(url?: string): 'web' | 'local_file' | 'local_app'
   }
   return 'web';
 }
+
+export type { DownloadableFile, FileCategory } from '@/lib/parser/fileDetector';
+

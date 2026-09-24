@@ -3,10 +3,10 @@ import {
   FolderKanban, Sparkles, Download, FileText, Video, Camera,
   Bot, Settings, CheckCircle2, AlertCircle, RefreshCw, 
   Plus, Tag, Bookmark, Layers, HardDrive, Terminal,
-  Eye, EyeOff, Search, Compass
+  Eye, EyeOff, Search, Compass, FolderDown, Loader2, ArrowDownToLine
 } from 'lucide-react';
 import { set as setIdb } from 'idb-keyval';
-import { PluginSettings, DEFAULT_SETTINGS, ProjectConfig, CapturedItem, resolveUrlType } from '@/types';
+import { PluginSettings, DEFAULT_SETTINGS, ProjectConfig, CapturedItem, resolveUrlType, DownloadableFile, FileCategory, ExtensionMessage } from '@/types';
 import { getSettings, saveSettings, updateProject } from '@/lib/storage/settings';
 import { pickWorkspaceDirectory, getWorkspaceDirectoryHandle, ensureSensorDirectoryOnHandle } from '@/lib/storage/fsAccess';
 import { checkBridgeHealth, fetchSystemEnvFromBridge, initSensorWorkspaceViaBridge } from '@/lib/storage/bridgeClient';
@@ -14,6 +14,7 @@ import { getRecentCaptures, executeSaveBundle } from '@/lib/storage/bundleSaver'
 import { fetchAvailableModels } from '@/lib/ai/deepseek';
 import { trackEvent, fetchTelemetryInsights, discoverProjectsInDirectory } from '@/lib/telemetry/tracker';
 import { parseTopicsInput } from '@/lib/parser/topics';
+import { deriveFilename } from '@/lib/parser/fileDetector';
 
 export default function App() {
   const [settings, setSettings] = useState<PluginSettings>(DEFAULT_SETTINGS);
@@ -53,6 +54,14 @@ export default function App() {
   const [discoveredProjects, setDiscoveredProjects] = useState<{ path: string; name: string; hasDshSensor: boolean }[]>([]);
   const [parentScanDir, setParentScanDir] = useState<string>('');
   const [isScanning, setIsScanning] = useState<boolean>(false);
+
+  // 页面文件嗅探与批量下载状态
+  const [detectedFiles, setDetectedFiles] = useState<DownloadableFile[]>([]);
+  const [isDetectingFiles, setIsDetectingFiles] = useState(false);
+  const [fileFilterCategory, setFileFilterCategory] = useState<string>('all');
+  const [fileSearchKeyword, setFileSearchKeyword] = useState('');
+  const [isBatchDownloading, setIsBatchDownloading] = useState(false);
+  const [batchDownloadProgress, setBatchDownloadProgress] = useState<{ current: number; total: number; filename?: string } | null>(null);
 
   const showToast = (text: string, isError = false) => {
     setToastMsg({ text, isError });
@@ -177,6 +186,11 @@ export default function App() {
           if (msg.payload?.title) {
             showToast(`✓ 已自动同步新线索: ${msg.payload.title.slice(0, 20)}`);
           }
+        } else if (msg.type === 'OPEN_DOWNLOAD_PANEL') {
+          setCurrentView('workbench');
+          setTimeout(() => {
+            handleDetectFiles();
+          }, 150);
         }
       };
       chrome.runtime.onMessage.addListener(handleRuntimeMsg);
@@ -541,6 +555,281 @@ export default function App() {
         }
       }
     );
+  };
+
+  // 辅助函数：ArrayBuffer 转换 Base64
+  const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    const chunkSize = 0x8000;
+    for (let i = 0; i < len; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, Math.min(i + chunkSize, len))));
+    }
+    return btoa(binary);
+  };
+
+  const formatFileSize = (bytes: number): string => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  };
+
+  const downloadFileBlobDataUrl = async (url: string): Promise<{ dataUrl: string; size: number; contentType: string; serverFilename?: string }> => {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+    }
+    const contentType = resp.headers.get('content-type') || 'application/octet-stream';
+    const disposition = resp.headers.get('content-disposition') || '';
+    let serverFilename = '';
+    if (disposition) {
+      const filenameMatch = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)["']?/i);
+      if (filenameMatch && filenameMatch[1]) {
+        serverFilename = decodeURIComponent(filenameMatch[1].trim());
+      }
+    }
+
+    const buffer = await resp.arrayBuffer();
+    const size = buffer.byteLength;
+    const base64 = arrayBufferToBase64(buffer);
+    const dataUrl = `data:${contentType};base64,${base64}`;
+
+    return {
+      dataUrl,
+      size,
+      contentType,
+      serverFilename: serverFilename || undefined,
+    };
+  };
+
+  const getCategoryBadge = (category: FileCategory, extension: string) => {
+    switch (category) {
+      case 'document':
+        return { bg: 'bg-rose-100 text-rose-800 border-rose-200', label: extension.toUpperCase() || 'DOC' };
+      case 'data':
+        return { bg: 'bg-emerald-100 text-emerald-800 border-emerald-200', label: extension.toUpperCase() || 'DATA' };
+      case 'archive':
+        return { bg: 'bg-amber-100 text-amber-800 border-amber-200', label: extension.toUpperCase() || 'ZIP' };
+      case 'media':
+        return { bg: 'bg-sky-100 text-sky-800 border-sky-200', label: extension.toUpperCase() || 'MEDIA' };
+      case 'model':
+        return { bg: 'bg-purple-100 text-purple-800 border-purple-200', label: extension.toUpperCase() || 'MODEL' };
+      case 'code':
+        return { bg: 'bg-indigo-100 text-indigo-800 border-indigo-200', label: extension.toUpperCase() || 'CODE' };
+      default:
+        return { bg: 'bg-slate-100 text-slate-700 border-slate-200', label: extension.toUpperCase() || 'FILE' };
+    }
+  };
+
+  // 1-Click 嗅探当前页面的所有可下载文件
+  const handleDetectFiles = async () => {
+    const curTab = await refreshActiveTab();
+    if (!curTab.id) {
+      showToast('未检测到活跃标签页', true);
+      return;
+    }
+    if (isRestrictedUrl(curTab.url)) {
+      showToast('受限系统页面无法嗅探文件', true);
+      return;
+    }
+
+    setIsDetectingFiles(true);
+    await ensureContentScript(curTab.id);
+    chrome.tabs.sendMessage(curTab.id, { type: 'DETECT_PAGE_FILES' }, (res) => {
+      setIsDetectingFiles(false);
+      if (res && res.success && Array.isArray(res.files)) {
+        setDetectedFiles(res.files);
+        if (res.files.length === 0) {
+          showToast('当前页面未检测到可下载文件');
+        } else {
+          showToast(`已嗅探到本页 ${res.files.length} 个可下载文件`);
+        }
+      } else {
+        showToast(`嗅探文件失败: ${res?.error || '无法解析页面元素'}`, true);
+      }
+    });
+  };
+
+  // 单个文件下载至 DSH 研究目录并打标索引
+  const handleDownloadSingleFile = async (file: DownloadableFile) => {
+    const curTab = await refreshActiveTab();
+    setDetectedFiles(prev => prev.map(f => f.id === file.id ? { ...f, status: 'downloading', errorMessage: undefined } : f));
+    showToast(`⏳ 正在下载【${file.filename}】并索引至 DSH...`);
+
+    try {
+      const fileData = await downloadFileBlobDataUrl(file.url);
+      const derived = deriveFilename(file.url, fileData.serverFilename || file.filename);
+      const filename = fileData.serverFilename || file.filename || derived.filename;
+      const ext = derived.extension || file.extension || 'bin';
+      const sizeStr = formatFileSize(fileData.size);
+
+      const item: CapturedItem = {
+        id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        project: activeProject.name,
+        topic: activeTopics.join('+'),
+        topics: activeTopics,
+        title: `[文件] ${filename}`,
+        url: file.url,
+        urlType: resolveUrlType(file.url),
+        sourcePlatform: 'other',
+        capturedAt: new Date().toISOString(),
+        documentType: 'file',
+        tags: ['Download', 'File', ext.toUpperCase(), file.category, ...activeTopics],
+        markdownContent: `# 📁 文件下载索引: ${filename}\n\n> 🌐 **来源下载地址**: [${file.url}](${file.url})\n> 📄 **来源页面**: [${curTab.title || curTab.url || '未知页面'}](${curTab.url || file.url})\n> 🏷️ **归属主题**: ${activeTopics.join('、')}\n> 📦 **文件类型**: ${ext.toUpperCase()} (${file.category})\n> 📊 **文件大小**: ${sizeStr}\n> ⏰ **下载时刻**: ${new Date().toLocaleString()}\n\n---\n### 💾 本地物理文件\n- 相对路径: \`assets/${filename}\`\n- 存储空间: \`dshWebSensor/${activeTopics.join('+')}/.../assets/${filename}\`\n`,
+        mediaAttachments: [
+          {
+            id: `att-file-${Date.now()}`,
+            type: 'file',
+            originalUrl: file.url,
+            filename: filename,
+            localPath: `assets/${filename}`,
+            blobDataUrl: fileData.dataUrl,
+          },
+        ],
+      };
+
+      const result = await executeSaveBundle(item);
+      setDetectedFiles(prev => prev.map(f => f.id === file.id ? { ...f, status: 'saved', savedPath: result.savedPath } : f));
+      showToast(`✓【${filename}】已存入 DSH 研究目录并完成索引！`);
+      loadData();
+
+      trackEvent({
+        eventType: 'download_file',
+        projectId: activeProject.id,
+        projectName: activeProject.name,
+        topic: activeTopics.join('+'),
+        url: file.url,
+        pageTitle: filename,
+        metadata: {
+          filename,
+          category: file.category,
+          size: fileData.size,
+          savedPath: result.savedPath,
+        },
+      }).catch(() => {});
+    } catch (err) {
+      const errMsg = (err as Error).message || '下载失败';
+      setDetectedFiles(prev => prev.map(f => f.id === file.id ? { ...f, status: 'error', errorMessage: errMsg } : f));
+      showToast(`下载【${file.filename}】失败: ${errMsg}`, true);
+    }
+  };
+
+  // 批量下载所选文件至 DSH 研究目录并打标索引
+  const handleBatchDownloadSelected = async () => {
+    const toDownload = detectedFiles.filter(f => f.isSelected && f.status !== 'saved');
+    if (toDownload.length === 0) {
+      showToast('请先勾选需要下载的文件', true);
+      return;
+    }
+
+    setIsBatchDownloading(true);
+    setBatchDownloadProgress({ current: 0, total: toDownload.length, filename: toDownload[0].filename });
+    const curTab = await refreshActiveTab();
+
+    let successCount = 0;
+    let failCount = 0;
+
+    for (let i = 0; i < toDownload.length; i++) {
+      const file = toDownload[i];
+      setBatchDownloadProgress({ current: i + 1, total: toDownload.length, filename: file.filename });
+      setDetectedFiles(prev => prev.map(f => f.id === file.id ? { ...f, status: 'downloading', errorMessage: undefined } : f));
+
+      try {
+        const fileData = await downloadFileBlobDataUrl(file.url);
+        const derived = deriveFilename(file.url, fileData.serverFilename || file.filename);
+        const filename = fileData.serverFilename || file.filename || derived.filename;
+        const ext = derived.extension || file.extension || 'bin';
+        const sizeStr = formatFileSize(fileData.size);
+
+        const item: CapturedItem = {
+          id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          project: activeProject.name,
+          topic: activeTopics.join('+'),
+          topics: activeTopics,
+          title: `[文件] ${filename}`,
+          url: file.url,
+          urlType: resolveUrlType(file.url),
+          sourcePlatform: 'other',
+          capturedAt: new Date().toISOString(),
+          documentType: 'file',
+          tags: ['Download', 'File', ext.toUpperCase(), file.category, ...activeTopics],
+          markdownContent: `# 📁 文件下载索引: ${filename}\n\n> 🌐 **来源下载地址**: [${file.url}](${file.url})\n> 📄 **来源页面**: [${curTab.title || curTab.url || '未知页面'}](${curTab.url || file.url})\n> 🏷️ **归属主题**: ${activeTopics.join('、')}\n> 📦 **文件类型**: ${ext.toUpperCase()} (${file.category})\n> 📊 **文件大小**: ${sizeStr}\n> ⏰ **下载时刻**: ${new Date().toLocaleString()}\n\n---\n### 💾 本地物理文件\n- 相对路径: \`assets/${filename}\`\n- 存储空间: \`dshWebSensor/${activeTopics.join('+')}/.../assets/${filename}\`\n`,
+          mediaAttachments: [
+            {
+              id: `att-file-${Date.now()}`,
+              type: 'file',
+              originalUrl: file.url,
+              filename: filename,
+              localPath: `assets/${filename}`,
+              blobDataUrl: fileData.dataUrl,
+            },
+          ],
+        };
+
+        const result = await executeSaveBundle(item);
+        setDetectedFiles(prev => prev.map(f => f.id === file.id ? { ...f, status: 'saved', savedPath: result.savedPath } : f));
+        successCount++;
+      } catch (err) {
+        failCount++;
+        const errMsg = (err as Error).message || '下载失败';
+        setDetectedFiles(prev => prev.map(f => f.id === file.id ? { ...f, status: 'error', errorMessage: errMsg } : f));
+      }
+    }
+
+    setIsBatchDownloading(false);
+    setBatchDownloadProgress(null);
+    loadData();
+
+    trackEvent({
+      eventType: 'batch_download_files',
+      projectId: activeProject.id,
+      projectName: activeProject.name,
+      topic: activeTopics.join('+'),
+      metadata: {
+        total: toDownload.length,
+        successCount,
+        failCount,
+      },
+    }).catch(() => {});
+
+    if (failCount === 0) {
+      showToast(`🎉 批量下载完成！已将 ${successCount} 个文件全部存入 DSH 研究目录并打标索引`);
+    } else {
+      showToast(`批量下载结束: 成功 ${successCount} 个，失败 ${failCount} 个`, true);
+    }
+  };
+
+  const filteredFiles = detectedFiles.filter(f => {
+    if (fileFilterCategory !== 'all' && f.category !== fileFilterCategory) {
+      return false;
+    }
+    if (fileSearchKeyword.trim()) {
+      const kw = fileSearchKeyword.toLowerCase();
+      return f.filename.toLowerCase().includes(kw) || f.title.toLowerCase().includes(kw) || f.extension.toLowerCase().includes(kw);
+    }
+    return true;
+  });
+
+  const selectedCount = filteredFiles.filter(f => f.isSelected).length;
+
+  const categoryCounts = {
+    all: detectedFiles.length,
+    document: detectedFiles.filter(f => f.category === 'document').length,
+    data: detectedFiles.filter(f => f.category === 'data').length,
+    archive: detectedFiles.filter(f => f.category === 'archive').length,
+    media: detectedFiles.filter(f => f.category === 'media').length,
+    code: detectedFiles.filter(f => f.category === 'code').length,
+  };
+
+  const handleToggleSelectFile = (id: string) => {
+    setDetectedFiles(prev => prev.map(f => f.id === id ? { ...f, isSelected: !f.isSelected } : f));
+  };
+
+  const handleSelectAllFiles = (selectAll: boolean) => {
+    const filteredIds = new Set(filteredFiles.map(f => f.id));
+    setDetectedFiles(prev => prev.map(f => filteredIds.has(f.id) ? { ...f, isSelected: selectAll } : f));
   };
 
   // 快速提交便签/灵感
@@ -1118,6 +1407,246 @@ export default function App() {
                 {settings.deepseekApiKey ? '已就绪' : '未配 Key (基础抓取)'}
               </span>
             </div>
+          </div>
+
+          {/* 页面文件嗅探与批量下载卡片 */}
+          <div className="bg-white rounded-lg p-2.5 border border-slate-200 shadow-sm space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="text-[11px] font-medium text-slate-800 flex items-center gap-1.5">
+                <FolderDown className="w-3.5 h-3.5 text-blue-600" />
+                <span>页面文件嗅探与批量下载</span>
+                {detectedFiles.length > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-blue-50 text-blue-600 font-mono font-medium border border-blue-200">
+                    {detectedFiles.length} 个
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={handleDetectFiles}
+                  disabled={isDetectingFiles}
+                  className="px-2 py-0.5 rounded text-[10px] font-medium bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 transition flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                  title="扫描当前标签页中的所有 PDF、Word、表格、压缩包及音视频等文件"
+                >
+                  <Search className={`w-3 h-3 ${isDetectingFiles ? 'animate-spin' : ''}`} />
+                  <span>{isDetectingFiles ? '嗅探中...' : (detectedFiles.length > 0 ? '刷新嗅探' : '🔍 嗅探本页文件')}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 如果已嗅探到文件 */}
+            {detectedFiles.length > 0 ? (
+              <div className="space-y-2 pt-1 border-t border-slate-100">
+                {/* 存储空间与标签指引 */}
+                <div className="p-1.5 rounded bg-slate-50 border border-slate-200/70 text-[10px] text-slate-600 flex items-center justify-between">
+                  <div className="flex items-center gap-1 truncate mr-1">
+                    <span className="text-slate-400">存入空间:</span>
+                    <span className="font-semibold text-slate-800">{activeProject.name}</span>
+                    <span className="text-slate-400">/</span>
+                    <span className="font-mono text-emerald-700 font-medium truncate">dshWebSensor/{activeTopics.join('+')}</span>
+                  </div>
+                  <span className="text-[9px] px-1 py-0.2 bg-emerald-50 text-emerald-700 rounded border border-emerald-200 font-medium shrink-0">
+                    自动打标索引
+                  </span>
+                </div>
+
+                {/* 分类筛选胶囊 */}
+                <div className="flex items-center gap-1 overflow-x-auto pb-0.5 text-[10px]">
+                  <button
+                    onClick={() => setFileFilterCategory('all')}
+                    className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'all' ? 'bg-slate-800 text-white font-medium' : 'bg-slate-100 hover:bg-slate-200 text-slate-600'}`}
+                  >
+                    全部 ({categoryCounts.all})
+                  </button>
+                  {categoryCounts.document > 0 && (
+                    <button
+                      onClick={() => setFileFilterCategory('document')}
+                      className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'document' ? 'bg-rose-700 text-white font-medium' : 'bg-rose-50 hover:bg-rose-100 text-rose-700'}`}
+                    >
+                      文档 ({categoryCounts.document})
+                    </button>
+                  )}
+                  {categoryCounts.data > 0 && (
+                    <button
+                      onClick={() => setFileFilterCategory('data')}
+                      className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'data' ? 'bg-emerald-700 text-white font-medium' : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700'}`}
+                    >
+                      数据 ({categoryCounts.data})
+                    </button>
+                  )}
+                  {categoryCounts.archive > 0 && (
+                    <button
+                      onClick={() => setFileFilterCategory('archive')}
+                      className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'archive' ? 'bg-amber-700 text-white font-medium' : 'bg-amber-50 hover:bg-amber-100 text-amber-700'}`}
+                    >
+                      压缩包 ({categoryCounts.archive})
+                    </button>
+                  )}
+                  {categoryCounts.media > 0 && (
+                    <button
+                      onClick={() => setFileFilterCategory('media')}
+                      className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'media' ? 'bg-sky-700 text-white font-medium' : 'bg-sky-50 hover:bg-sky-100 text-sky-700'}`}
+                    >
+                      媒体 ({categoryCounts.media})
+                    </button>
+                  )}
+                  {categoryCounts.code > 0 && (
+                    <button
+                      onClick={() => setFileFilterCategory('code')}
+                      className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'code' ? 'bg-indigo-700 text-white font-medium' : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700'}`}
+                    >
+                      代码 ({categoryCounts.code})
+                    </button>
+                  )}
+                </div>
+
+                {/* 搜索框与选择控制 */}
+                <div className="flex items-center justify-between gap-1.5 text-xs">
+                  <div className="relative flex-1">
+                    <input
+                      type="text"
+                      placeholder="搜索文件名..."
+                      value={fileSearchKeyword}
+                      onChange={(e) => setFileSearchKeyword(e.target.value)}
+                      className="w-full pl-2 pr-5 py-1 bg-slate-50 border border-slate-200 rounded text-[11px] focus:bg-white focus:border-blue-500 focus:outline-none"
+                    />
+                    {fileSearchKeyword && (
+                      <button
+                        onClick={() => setFileSearchKeyword('')}
+                        className="absolute right-1.5 top-1.5 text-slate-400 hover:text-slate-600 text-[10px]"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0 text-[10px]">
+                    <button
+                      onClick={() => handleSelectAllFiles(selectedCount < filteredFiles.length)}
+                      className="px-1.5 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium cursor-pointer"
+                    >
+                      {selectedCount === filteredFiles.length ? '取消全选' : '全选'}
+                    </button>
+                    <span className="text-slate-400">已选 {selectedCount}/{filteredFiles.length}</span>
+                  </div>
+                </div>
+
+                {/* 文件条目列表 */}
+                <div className="max-h-48 overflow-y-auto space-y-1.5 pr-0.5">
+                  {filteredFiles.length === 0 ? (
+                    <div className="py-4 text-center text-slate-400 text-xs">无匹配文件</div>
+                  ) : (
+                    filteredFiles.map(file => {
+                      const badge = getCategoryBadge(file.category, file.extension);
+                      return (
+                        <div
+                          key={file.id}
+                          className={`p-1.5 rounded border transition flex items-center justify-between gap-1.5 ${file.isSelected ? 'bg-blue-50/40 border-blue-200' : 'bg-slate-50/60 border-slate-200/80'}`}
+                        >
+                          <div className="flex items-center gap-2 truncate flex-1 min-w-0">
+                            <input
+                              type="checkbox"
+                              checked={file.isSelected || false}
+                              onChange={() => handleToggleSelectFile(file.id)}
+                              className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                            />
+                            <span className={`px-1 py-0.2 rounded text-[9px] font-mono font-medium border shrink-0 ${badge.bg}`}>
+                              {badge.label}
+                            </span>
+                            <div className="truncate flex-1 min-w-0">
+                              <div className="text-[11px] font-medium text-slate-800 truncate" title={file.filename}>
+                                {file.filename}
+                              </div>
+                              <div className="text-[9px] text-slate-400 truncate flex items-center gap-1.5">
+                                {file.fileSizeEstimate && <span className="font-mono text-slate-500">{file.fileSizeEstimate}</span>}
+                                <span className="truncate">{file.url}</span>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="shrink-0 flex items-center gap-1">
+                            {file.status === 'downloading' && (
+                              <span className="text-[10px] text-blue-600 flex items-center gap-0.5">
+                                <Loader2 className="w-3 h-3 animate-spin" /> 下载中
+                              </span>
+                            )}
+                            {file.status === 'saved' && (
+                              <span className="text-[10px] text-emerald-600 font-medium flex items-center gap-0.5">
+                                <CheckCircle2 className="w-3 h-3" /> 已入库
+                              </span>
+                            )}
+                            {file.status === 'error' && (
+                              <button
+                                onClick={() => handleDownloadSingleFile(file)}
+                                className="text-[9px] px-1 py-0.5 rounded bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-medium cursor-pointer"
+                                title={file.errorMessage || '下载重试'}
+                              >
+                                重试
+                              </button>
+                            )}
+                            {(!file.status || file.status === 'pending') && (
+                              <button
+                                onClick={() => handleDownloadSingleFile(file)}
+                                className="px-1.5 py-0.5 rounded bg-white hover:bg-blue-50 text-blue-700 border border-slate-200 hover:border-blue-300 text-[10px] font-medium flex items-center gap-0.5 shadow-2xs transition cursor-pointer"
+                                title="单独下载此文件至 DSH 研究目录"
+                              >
+                                <ArrowDownToLine className="w-2.5 h-2.5" />
+                                <span>下载</span>
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+
+                {/* 批量下载主按钮与实时进度条 */}
+                <div className="pt-1 border-t border-slate-100">
+                  {batchDownloadProgress ? (
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[10px] text-blue-700 font-medium">
+                        <span className="flex items-center gap-1">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          正在下载 {batchDownloadProgress.current}/{batchDownloadProgress.total}...
+                        </span>
+                        <span className="font-mono text-slate-500 truncate max-w-[140px]">
+                          {batchDownloadProgress.filename}
+                        </span>
+                      </div>
+                      <div className="w-full bg-slate-200 rounded-full h-1.5 overflow-hidden">
+                        <div
+                          className="bg-blue-600 h-1.5 rounded-full transition-all duration-200"
+                          style={{ width: `${(batchDownloadProgress.current / batchDownloadProgress.total) * 100}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={handleBatchDownloadSelected}
+                      disabled={selectedCount === 0 || isBatchDownloading}
+                      className="w-full py-1.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded text-xs font-medium transition shadow-xs flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                    >
+                      <FolderDown className="w-3.5 h-3.5" />
+                      <span>🚀 批量下载选中的 {selectedCount} 个文件至 DSH</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="p-3 bg-slate-50/80 rounded border border-dashed border-slate-200 text-center space-y-1.5">
+                <p className="text-[10px] text-slate-500 leading-relaxed">
+                  点击按钮一键智能识别当前网页中的 <strong className="text-slate-700 font-medium">PDF 论文、Word/PPT 讲义、CSV 数据、ZIP 源码包与音视频</strong>。
+                </p>
+                <button
+                  onClick={handleDetectFiles}
+                  disabled={isDetectingFiles}
+                  className="px-3 py-1 bg-white hover:bg-blue-50 text-blue-700 border border-blue-300 rounded text-xs font-medium transition inline-flex items-center gap-1 shadow-2xs cursor-pointer disabled:opacity-60"
+                >
+                  <Search className={`w-3 h-3 ${isDetectingFiles ? 'animate-spin' : ''}`} />
+                  <span>{isDetectingFiles ? '正在嗅探网页资源...' : '开始嗅探本页文件'}</span>
+                </button>
+              </div>
+            )}
           </div>
 
           {/* 即时便签输入 */}
