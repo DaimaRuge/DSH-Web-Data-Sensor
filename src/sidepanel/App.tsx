@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { 
   FolderKanban, Sparkles, Download, FileText, Video, Camera,
   Bot, Settings, CheckCircle2, AlertCircle, RefreshCw, 
@@ -60,6 +60,7 @@ export default function App() {
   const [isDetectingFiles, setIsDetectingFiles] = useState(false);
   const [fileFilterCategory, setFileFilterCategory] = useState<string>('all');
   const [fileSearchKeyword, setFileSearchKeyword] = useState('');
+  const [fileDisplayLimit, setFileDisplayLimit] = useState<number>(30);
   const [isBatchDownloading, setIsBatchDownloading] = useState(false);
   const [batchDownloadProgress, setBatchDownloadProgress] = useState<{ current: number; total: number; filename?: string } | null>(null);
 
@@ -641,6 +642,7 @@ export default function App() {
       setIsDetectingFiles(false);
       if (res && res.success && Array.isArray(res.files)) {
         setDetectedFiles(res.files);
+        setFileDisplayLimit(30);
         if (res.files.length === 0) {
           showToast('当前页面未检测到可下载文件');
         } else {
@@ -801,36 +803,48 @@ export default function App() {
     }
   };
 
-  const filteredFiles = detectedFiles.filter(f => {
-    if (fileFilterCategory !== 'all' && f.category !== fileFilterCategory) {
-      return false;
+  const filteredFiles = useMemo(() => {
+    return detectedFiles.filter(f => {
+      if (fileFilterCategory !== 'all' && f.category !== fileFilterCategory) {
+        return false;
+      }
+      if (fileSearchKeyword.trim()) {
+        const kw = fileSearchKeyword.toLowerCase();
+        return f.filename.toLowerCase().includes(kw) || f.title.toLowerCase().includes(kw) || f.extension.toLowerCase().includes(kw);
+      }
+      return true;
+    });
+  }, [detectedFiles, fileFilterCategory, fileSearchKeyword]);
+
+  const selectedCount = useMemo(() => {
+    return filteredFiles.filter(f => f.isSelected).length;
+  }, [filteredFiles]);
+
+  const categoryCounts = useMemo(() => {
+    const counts = {
+      all: detectedFiles.length,
+      document: 0,
+      data: 0,
+      archive: 0,
+      media: 0,
+      code: 0,
+    };
+    for (const f of detectedFiles) {
+      if (f.category in counts) {
+        counts[f.category as keyof typeof counts]++;
+      }
     }
-    if (fileSearchKeyword.trim()) {
-      const kw = fileSearchKeyword.toLowerCase();
-      return f.filename.toLowerCase().includes(kw) || f.title.toLowerCase().includes(kw) || f.extension.toLowerCase().includes(kw);
-    }
-    return true;
-  });
+    return counts;
+  }, [detectedFiles]);
 
-  const selectedCount = filteredFiles.filter(f => f.isSelected).length;
-
-  const categoryCounts = {
-    all: detectedFiles.length,
-    document: detectedFiles.filter(f => f.category === 'document').length,
-    data: detectedFiles.filter(f => f.category === 'data').length,
-    archive: detectedFiles.filter(f => f.category === 'archive').length,
-    media: detectedFiles.filter(f => f.category === 'media').length,
-    code: detectedFiles.filter(f => f.category === 'code').length,
-  };
-
-  const handleToggleSelectFile = (id: string) => {
+  const handleToggleSelectFile = useCallback((id: string) => {
     setDetectedFiles(prev => prev.map(f => f.id === id ? { ...f, isSelected: !f.isSelected } : f));
-  };
+  }, []);
 
-  const handleSelectAllFiles = (selectAll: boolean) => {
+  const handleSelectAllFiles = useCallback((selectAll: boolean) => {
     const filteredIds = new Set(filteredFiles.map(f => f.id));
     setDetectedFiles(prev => prev.map(f => filteredIds.has(f.id) ? { ...f, isSelected: selectAll } : f));
-  };
+  }, [filteredFiles]);
 
   // 快速提交便签/灵感
   const handleSaveQuickNote = async () => {
@@ -1453,14 +1467,14 @@ export default function App() {
                 {/* 分类筛选胶囊 */}
                 <div className="flex items-center gap-1 overflow-x-auto pb-0.5 text-[10px]">
                   <button
-                    onClick={() => setFileFilterCategory('all')}
+                    onClick={() => { setFileFilterCategory('all'); setFileDisplayLimit(30); }}
                     className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'all' ? 'bg-slate-800 text-white font-medium' : 'bg-slate-100 hover:bg-slate-200 text-slate-600'}`}
                   >
                     全部 ({categoryCounts.all})
                   </button>
                   {categoryCounts.document > 0 && (
                     <button
-                      onClick={() => setFileFilterCategory('document')}
+                      onClick={() => { setFileFilterCategory('document'); setFileDisplayLimit(30); }}
                       className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'document' ? 'bg-rose-700 text-white font-medium' : 'bg-rose-50 hover:bg-rose-100 text-rose-700'}`}
                     >
                       文档 ({categoryCounts.document})
@@ -1468,7 +1482,7 @@ export default function App() {
                   )}
                   {categoryCounts.data > 0 && (
                     <button
-                      onClick={() => setFileFilterCategory('data')}
+                      onClick={() => { setFileFilterCategory('data'); setFileDisplayLimit(30); }}
                       className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'data' ? 'bg-emerald-700 text-white font-medium' : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700'}`}
                     >
                       数据 ({categoryCounts.data})
@@ -1476,7 +1490,7 @@ export default function App() {
                   )}
                   {categoryCounts.archive > 0 && (
                     <button
-                      onClick={() => setFileFilterCategory('archive')}
+                      onClick={() => { setFileFilterCategory('archive'); setFileDisplayLimit(30); }}
                       className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'archive' ? 'bg-amber-700 text-white font-medium' : 'bg-amber-50 hover:bg-amber-100 text-amber-700'}`}
                     >
                       压缩包 ({categoryCounts.archive})
@@ -1484,7 +1498,7 @@ export default function App() {
                   )}
                   {categoryCounts.media > 0 && (
                     <button
-                      onClick={() => setFileFilterCategory('media')}
+                      onClick={() => { setFileFilterCategory('media'); setFileDisplayLimit(30); }}
                       className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'media' ? 'bg-sky-700 text-white font-medium' : 'bg-sky-50 hover:bg-sky-100 text-sky-700'}`}
                     >
                       媒体 ({categoryCounts.media})
@@ -1492,7 +1506,7 @@ export default function App() {
                   )}
                   {categoryCounts.code > 0 && (
                     <button
-                      onClick={() => setFileFilterCategory('code')}
+                      onClick={() => { setFileFilterCategory('code'); setFileDisplayLimit(30); }}
                       className={`px-1.5 py-0.5 rounded-full transition shrink-0 ${fileFilterCategory === 'code' ? 'bg-indigo-700 text-white font-medium' : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700'}`}
                     >
                       代码 ({categoryCounts.code})
@@ -1507,12 +1521,18 @@ export default function App() {
                       type="text"
                       placeholder="搜索文件名..."
                       value={fileSearchKeyword}
-                      onChange={(e) => setFileSearchKeyword(e.target.value)}
+                      onChange={(e) => {
+                        setFileSearchKeyword(e.target.value);
+                        setFileDisplayLimit(30);
+                      }}
                       className="w-full pl-2 pr-5 py-1 bg-slate-50 border border-slate-200 rounded text-[11px] focus:bg-white focus:border-blue-500 focus:outline-none"
                     />
                     {fileSearchKeyword && (
                       <button
-                        onClick={() => setFileSearchKeyword('')}
+                        onClick={() => {
+                          setFileSearchKeyword('');
+                          setFileDisplayLimit(30);
+                        }}
                         className="absolute right-1.5 top-1.5 text-slate-400 hover:text-slate-600 text-[10px]"
                       >
                         ✕
@@ -1535,68 +1555,78 @@ export default function App() {
                   {filteredFiles.length === 0 ? (
                     <div className="py-4 text-center text-slate-400 text-xs">无匹配文件</div>
                   ) : (
-                    filteredFiles.map(file => {
-                      const badge = getCategoryBadge(file.category, file.extension);
-                      return (
-                        <div
-                          key={file.id}
-                          className={`p-1.5 rounded border transition flex items-center justify-between gap-1.5 ${file.isSelected ? 'bg-blue-50/40 border-blue-200' : 'bg-slate-50/60 border-slate-200/80'}`}
-                        >
-                          <div className="flex items-center gap-2 truncate flex-1 min-w-0">
-                            <input
-                              type="checkbox"
-                              checked={file.isSelected || false}
-                              onChange={() => handleToggleSelectFile(file.id)}
-                              className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
-                            />
-                            <span className={`px-1 py-0.2 rounded text-[9px] font-mono font-medium border shrink-0 ${badge.bg}`}>
-                              {badge.label}
-                            </span>
-                            <div className="truncate flex-1 min-w-0">
-                              <div className="text-[11px] font-medium text-slate-800 truncate" title={file.filename}>
-                                {file.filename}
-                              </div>
-                              <div className="text-[9px] text-slate-400 truncate flex items-center gap-1.5">
-                                {file.fileSizeEstimate && <span className="font-mono text-slate-500">{file.fileSizeEstimate}</span>}
-                                <span className="truncate">{file.url}</span>
+                    <>
+                      {filteredFiles.slice(0, fileDisplayLimit).map(file => {
+                        const badge = getCategoryBadge(file.category, file.extension);
+                        return (
+                          <div
+                            key={file.id}
+                            className={`p-1.5 rounded border transition flex items-center justify-between gap-1.5 ${file.isSelected ? 'bg-blue-50/40 border-blue-200' : 'bg-slate-50/60 border-slate-200/80'}`}
+                          >
+                            <div className="flex items-center gap-2 truncate flex-1 min-w-0">
+                              <input
+                                type="checkbox"
+                                checked={file.isSelected || false}
+                                onChange={() => handleToggleSelectFile(file.id)}
+                                className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                              />
+                              <span className={`px-1 py-0.2 rounded text-[9px] font-mono font-medium border shrink-0 ${badge.bg}`}>
+                                {badge.label}
+                              </span>
+                              <div className="truncate flex-1 min-w-0">
+                                <div className="text-[11px] font-medium text-slate-800 truncate" title={file.filename}>
+                                  {file.filename}
+                                </div>
+                                <div className="text-[9px] text-slate-400 truncate flex items-center gap-1.5">
+                                  {file.fileSizeEstimate && <span className="font-mono text-slate-500">{file.fileSizeEstimate}</span>}
+                                  <span className="truncate">{file.url}</span>
+                                </div>
                               </div>
                             </div>
-                          </div>
 
-                          <div className="shrink-0 flex items-center gap-1">
-                            {file.status === 'downloading' && (
-                              <span className="text-[10px] text-blue-600 flex items-center gap-0.5">
-                                <Loader2 className="w-3 h-3 animate-spin" /> 下载中
-                              </span>
-                            )}
-                            {file.status === 'saved' && (
-                              <span className="text-[10px] text-emerald-600 font-medium flex items-center gap-0.5">
-                                <CheckCircle2 className="w-3 h-3" /> 已入库
-                              </span>
-                            )}
-                            {file.status === 'error' && (
-                              <button
-                                onClick={() => handleDownloadSingleFile(file)}
-                                className="text-[9px] px-1 py-0.5 rounded bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-medium cursor-pointer"
-                                title={file.errorMessage || '下载重试'}
-                              >
-                                重试
-                              </button>
-                            )}
-                            {(!file.status || file.status === 'pending') && (
-                              <button
-                                onClick={() => handleDownloadSingleFile(file)}
-                                className="px-1.5 py-0.5 rounded bg-white hover:bg-blue-50 text-blue-700 border border-slate-200 hover:border-blue-300 text-[10px] font-medium flex items-center gap-0.5 shadow-2xs transition cursor-pointer"
-                                title="单独下载此文件至 DSH 研究目录"
-                              >
-                                <ArrowDownToLine className="w-2.5 h-2.5" />
-                                <span>下载</span>
-                              </button>
-                            )}
+                            <div className="shrink-0 flex items-center gap-1">
+                              {file.status === 'downloading' && (
+                                <span className="text-[10px] text-blue-600 flex items-center gap-0.5">
+                                  <Loader2 className="w-3 h-3 animate-spin" /> 下载中
+                                </span>
+                              )}
+                              {file.status === 'saved' && (
+                                <span className="text-[10px] text-emerald-600 font-medium flex items-center gap-0.5">
+                                  <CheckCircle2 className="w-3 h-3" /> 已入库
+                                </span>
+                              )}
+                              {file.status === 'error' && (
+                                <button
+                                  onClick={() => handleDownloadSingleFile(file)}
+                                  className="text-[9px] px-1 py-0.5 rounded bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-medium cursor-pointer"
+                                  title={file.errorMessage || '下载重试'}
+                                >
+                                  重试
+                                </button>
+                              )}
+                              {(!file.status || file.status === 'pending') && (
+                                <button
+                                  onClick={() => handleDownloadSingleFile(file)}
+                                  className="px-1.5 py-0.5 rounded bg-white hover:bg-blue-50 text-blue-700 border border-slate-200 hover:border-blue-300 text-[10px] font-medium flex items-center gap-0.5 shadow-2xs transition cursor-pointer"
+                                  title="单独下载此文件至 DSH 研究目录"
+                                >
+                                  <ArrowDownToLine className="w-2.5 h-2.5" />
+                                  <span>下载</span>
+                                </button>
+                              )}
+                            </div>
                           </div>
-                        </div>
-                      );
-                    })
+                        );
+                      })}
+                      {filteredFiles.length > fileDisplayLimit && (
+                        <button
+                          onClick={() => setFileDisplayLimit(prev => prev + 30)}
+                          className="w-full py-1 text-center text-[10px] text-blue-600 bg-blue-50/60 hover:bg-blue-100/80 border border-blue-200 rounded font-medium transition cursor-pointer"
+                        >
+                          显示更多文件 (已显示 {Math.min(fileDisplayLimit, filteredFiles.length)} / 共 {filteredFiles.length} 项)
+                        </button>
+                      )}
+                    </>
                   )}
                 </div>
 

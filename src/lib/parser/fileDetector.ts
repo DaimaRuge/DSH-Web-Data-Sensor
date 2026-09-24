@@ -93,16 +93,13 @@ const EXTENSION_CATEGORY_MAP: Record<string, FileCategory> = {
   sh: 'code',
 };
 
-// 正则检测特殊下载接口 URL (如 GitHub releases, 云盘直链, 带有 download/attachment 参数等)
+// 正则检测特殊下载接口 URL (如 GitHub releases, 云盘直链, 带有 export=download 参数等)
 const DOWNLOAD_URL_PATTERNS = [
-  /\/releases\/download\//i,
-  /\/download\b/i,
-  /\bexport=download\b/i,
-  /\bresponse-content-disposition=attachment\b/i,
-  /\battachment\b/i,
-  /\bfile_download\b/i,
-  /\/raw\//i,
-  /\/blobs\/download\//i,
+  /\/releases\/download\/[^/]+\/[^/]+$/i,
+  /\/raw\/[^/]+\/[^/]+\.[a-zA-Z0-9]{2,6}$/i,
+  /\/blobs\/download\/[^/]+$/i,
+  /[?&](?:export|action|download)=download\b/i,
+  /[?&]response-content-disposition=attachment\b/i,
 ];
 
 /**
@@ -210,34 +207,60 @@ export function extractSizeEstimate(text: string): string | undefined {
  * 判断一个 URL 是否为可下载文件
  */
 export function isDownloadableUrl(rawUrl: string, downloadAttr?: string | null): boolean {
-  if (!rawUrl || rawUrl.startsWith('javascript:') || rawUrl.startsWith('#') || rawUrl.startsWith('mailto:')) {
+  if (!rawUrl || rawUrl.startsWith('javascript:') || rawUrl.startsWith('#') || rawUrl.startsWith('mailto:') || rawUrl.startsWith('tel:')) {
     return false;
   }
 
+  // 若明确带有 download 属性，直接认定为下载项
   if (downloadAttr !== undefined && downloadAttr !== null) {
     return true;
   }
 
-  // 提取路径中的扩展名
   try {
     const urlObj = new URL(rawUrl, 'https://example.com');
     const pathname = urlObj.pathname.toLowerCase();
-    
-    // 检查已知扩展名
-    for (const ext of Object.keys(EXTENSION_CATEGORY_MAP)) {
-      if (pathname.endsWith(`.${ext}`) || pathname.includes(`.${ext}/`)) {
+
+    // 显式排除常见网页端动态路由及 html 页面，绝非独立文件
+    if (/\.(html?|shtml|php|jsp|asp|aspx)(?:[?#]|$)/i.test(pathname)) {
+      return false;
+    }
+
+    // 1. 严格检查末尾文件名（例如 /path/to/doc.pdf -> 扩展名为 pdf）
+    const segments = pathname.split('/').filter(Boolean);
+    const lastSegment = segments.pop() || '';
+    const dotIdx = lastSegment.lastIndexOf('.');
+    if (dotIdx > 0 && dotIdx < lastSegment.length - 1) {
+      const ext = lastSegment.slice(dotIdx + 1);
+      if (ext in EXTENSION_CATEGORY_MAP) {
+        // 对常见网页脚本文档 (.js, .css) 仅在含有 download 属性或显式文件时接纳，防止抓到页面本身的 script 链接
+        if (ext === 'js') {
+          return false;
+        }
         return true;
       }
     }
 
-    // 检查已知下载 pattern
+    // 2. 检查 query 参数中的明确文件名（如 ?file=paper.pdf 或 ?filename=dataset.csv）
+    if (urlObj.search) {
+      for (const key of ['filename', 'file', 'name', 'attachment']) {
+        const val = urlObj.searchParams.get(key);
+        if (val && val.includes('.')) {
+          const qExt = val.split('.').pop()?.toLowerCase();
+          if (qExt && qExt in EXTENSION_CATEGORY_MAP && qExt !== 'js') {
+            return true;
+          }
+        }
+      }
+    }
+
+    // 3. 检查白名单专用下载接口 Pattern
     for (const pattern of DOWNLOAD_URL_PATTERNS) {
       if (pattern.test(rawUrl)) {
         return true;
       }
     }
   } catch {
-    // 无法解析为标准 URL
+    // 无法解析标准 URL
   }
 
   return false;
@@ -249,37 +272,44 @@ export function isDownloadableUrl(rawUrl: string, downloadAttr?: string | null):
 export function scanElementForDownloadableFiles(container: Document | HTMLElement, baseUrl: string): DownloadableFile[] {
   const results: DownloadableFile[] = [];
   const seenUrls = new Set<string>();
+  const MAX_DETECTED_FILES = 120; // 严格上限，杜绝内存与 DOM 树雪崩
 
   // 1. 扫描 <a> 标签
   const anchors = container.querySelectorAll<HTMLAnchorElement>('a[href]');
-  anchors.forEach(a => {
+  for (let i = 0; i < anchors.length; i++) {
+    if (results.length >= MAX_DETECTED_FILES) break;
+    const a = anchors[i];
+
     const rawHref = a.getAttribute('href');
-    if (!rawHref) return;
+    if (!rawHref) continue;
 
     let absoluteUrl = '';
     try {
       absoluteUrl = new URL(rawHref, baseUrl).href;
     } catch {
-      return;
+      continue;
     }
 
     const downloadAttr = a.getAttribute('download');
     if (!isDownloadableUrl(absoluteUrl, downloadAttr)) {
-      return;
+      continue;
     }
 
     // 去重
     const normalizedUrl = absoluteUrl.split('#')[0];
     if (seenUrls.has(normalizedUrl)) {
-      return;
+      continue;
     }
     seenUrls.add(normalizedUrl);
 
-    const linkText = a.innerText?.trim() || a.getAttribute('title') || a.getAttribute('aria-label') || '';
-    const surroundingText = a.parentElement?.innerText || '';
+    // 采用 textContent 替代 innerText，避免强制触发浏览器同步布局 (Forced Reflow)
+    const linkText = (a.textContent || '').trim() || a.getAttribute('title') || a.getAttribute('aria-label') || '';
+    // 仅安全获取紧邻后继文本节点极短片段（如 " (1.5 MB)"），绝不遍历整个父容器序列化大文本
+    const siblingText = (a.nextSibling?.textContent || '').trim().slice(0, 60);
+
     const { filename, extension } = deriveFilename(absoluteUrl, downloadAttr, linkText);
     const category = getCategoryForExtension(extension, absoluteUrl);
-    const fileSizeEstimate = extractSizeEstimate(linkText) || extractSizeEstimate(surroundingText);
+    const fileSizeEstimate = extractSizeEstimate(linkText) || extractSizeEstimate(siblingText);
 
     results.push({
       id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -292,77 +322,83 @@ export function scanElementForDownloadableFiles(container: Document | HTMLElemen
       isSelected: true,
       status: 'pending',
     });
-  });
+  }
 
   // 2. 扫描 <iframe> / <embed> / <object> (例如内嵌 PDF 预览)
-  const embeds = container.querySelectorAll<HTMLElement>('iframe[src], embed[src], object[data]');
-  embeds.forEach(elem => {
-    const src = elem.getAttribute('src') || elem.getAttribute('data');
-    if (!src) return;
+  if (results.length < MAX_DETECTED_FILES) {
+    const embeds = container.querySelectorAll<HTMLElement>('iframe[src], embed[src], object[data]');
+    for (let i = 0; i < embeds.length; i++) {
+      if (results.length >= MAX_DETECTED_FILES) break;
+      const elem = embeds[i];
+      const src = elem.getAttribute('src') || elem.getAttribute('data');
+      if (!src) continue;
 
-    let absoluteUrl = '';
-    try {
-      absoluteUrl = new URL(src, baseUrl).href;
-    } catch {
-      return;
+      let absoluteUrl = '';
+      try {
+        absoluteUrl = new URL(src, baseUrl).href;
+      } catch {
+        continue;
+      }
+
+      if (!isDownloadableUrl(absoluteUrl)) continue;
+
+      const normalizedUrl = absoluteUrl.split('#')[0];
+      if (seenUrls.has(normalizedUrl)) continue;
+      seenUrls.add(normalizedUrl);
+
+      const { filename, extension } = deriveFilename(absoluteUrl);
+      const category = getCategoryForExtension(extension, absoluteUrl);
+
+      results.push({
+        id: `file-embed-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        url: absoluteUrl,
+        filename,
+        extension: extension || 'pdf',
+        category,
+        title: `[内嵌文档] ${filename}`,
+        isSelected: true,
+        status: 'pending',
+      });
     }
-
-    if (!isDownloadableUrl(absoluteUrl)) {
-      return;
-    }
-
-    const normalizedUrl = absoluteUrl.split('#')[0];
-    if (seenUrls.has(normalizedUrl)) return;
-    seenUrls.add(normalizedUrl);
-
-    const { filename, extension } = deriveFilename(absoluteUrl);
-    const category = getCategoryForExtension(extension, absoluteUrl);
-
-    results.push({
-      id: `file-embed-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      url: absoluteUrl,
-      filename,
-      extension: extension || 'pdf',
-      category,
-      title: `[内嵌文档] ${filename}`,
-      isSelected: true,
-      status: 'pending',
-    });
-  });
+  }
 
   // 3. 扫描 <video> / <audio> / <source> 多媒体直链
-  const mediaElements = container.querySelectorAll<HTMLElement>('video[src], audio[src], source[src]');
-  mediaElements.forEach(elem => {
-    const src = elem.getAttribute('src');
-    if (!src) return;
+  if (results.length < MAX_DETECTED_FILES) {
+    const mediaElements = container.querySelectorAll<HTMLElement>('video[src], audio[src], source[src]');
+    for (let i = 0; i < mediaElements.length; i++) {
+      if (results.length >= MAX_DETECTED_FILES) break;
+      const elem = mediaElements[i];
+      const src = elem.getAttribute('src');
+      if (!src) continue;
 
-    let absoluteUrl = '';
-    try {
-      absoluteUrl = new URL(src, baseUrl).href;
-    } catch {
-      return;
+      let absoluteUrl = '';
+      try {
+        absoluteUrl = new URL(src, baseUrl).href;
+      } catch {
+        continue;
+      }
+
+      if (!isDownloadableUrl(absoluteUrl)) continue;
+
+      const normalizedUrl = absoluteUrl.split('#')[0];
+      if (seenUrls.has(normalizedUrl)) continue;
+      seenUrls.add(normalizedUrl);
+
+      const { filename, extension } = deriveFilename(absoluteUrl);
+      const category = getCategoryForExtension(extension, absoluteUrl);
+
+      results.push({
+        id: `file-media-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        url: absoluteUrl,
+        filename,
+        extension: extension || 'mp4',
+        category,
+        title: `[音视频文件] ${filename}`,
+        isSelected: true,
+        status: 'pending',
+      });
     }
-
-    if (!isDownloadableUrl(absoluteUrl)) return;
-
-    const normalizedUrl = absoluteUrl.split('#')[0];
-    if (seenUrls.has(normalizedUrl)) return;
-    seenUrls.add(normalizedUrl);
-
-    const { filename, extension } = deriveFilename(absoluteUrl);
-    const category = getCategoryForExtension(extension, absoluteUrl);
-
-    results.push({
-      id: `file-media-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      url: absoluteUrl,
-      filename,
-      extension: extension || 'mp4',
-      category,
-      title: `[音视频文件] ${filename}`,
-      isSelected: true,
-      status: 'pending',
-    });
-  });
+  }
 
   return results;
 }
