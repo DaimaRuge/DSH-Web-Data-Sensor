@@ -8,47 +8,65 @@ if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
 }
 
-// 初始化右键菜单（先移除旧菜单，防止重复 ID 报错）
+// 辅助函数：安全创建右键菜单项
+function createMenuItem(options: chrome.contextMenus.CreateProperties) {
+  chrome.contextMenus.create(options, () => {
+    if (chrome.runtime.lastError) {
+      // 捕获已知重复或初始化提示，防止中断其它项
+      console.warn(`[DSH Menu] ${options.id} 提示:`, chrome.runtime.lastError.message);
+    }
+  });
+}
+
+// 初始化右键菜单：保持原有所有核心采集能力完好无损，并新增文件下载支持
 function setupContextMenus() {
   chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({
+    // 1. 【原核心功能】抓取当前页面为 DSH 线索（在空白处或链接上均可呼出）
+    createMenuItem({
       id: 'dsh-capture-page',
       title: '📥 抓取当前页面为 DSH 线索',
-      contexts: ['page'],
+      contexts: ['page', 'link'],
     });
 
-    chrome.contextMenus.create({
+    // 2. 【原核心功能】将选中文本存入 DSH 知识库（纯净划词右键专用）
+    createMenuItem({
       id: 'dsh-capture-selection',
       title: '✂️ 将选中文本存入 DSH 知识库',
       contexts: ['selection'],
     });
 
-    chrome.contextMenus.create({
-      id: 'dsh-download-file-link',
-      title: '📥 下载此文件到 DSH 研究目录并索引',
-      contexts: ['link'],
+    // 3. 【原核心功能】页面截图快照 (可裁剪标注) 存入 DSH（在页面或链接上均可直接发起）
+    createMenuItem({
+      id: 'dsh-capture-screenshot',
+      title: '📸 页面截图快照 (可裁剪标注) 存入 DSH',
+      contexts: ['page', 'link'],
     });
 
-    chrome.contextMenus.create({
-      id: 'dsh-batch-download-files',
-      title: '📦 批量下载本页文件到 DSH 研究目录',
-      contexts: ['page', 'selection'],
-    });
-
-    chrome.contextMenus.create({
+    // 4. 【原核心功能】将此图片存入 DSH 资源库（右键图片直接存盘）
+    createMenuItem({
       id: 'dsh-capture-image',
       title: '🖼️ 将此图片存入 DSH 资源库',
       contexts: ['image'],
     });
 
-    chrome.contextMenus.create({
-      id: 'dsh-capture-screenshot',
-      title: '📸 页面截图快照 (可裁剪标注) 存入 DSH',
+    // 5. 【新增扩展功能】单个文件下载：右键下载目标文件到当前研究目录并索引
+    createMenuItem({
+      id: 'dsh-download-file-link',
+      title: '📥 下载此文件到 DSH 研究目录并索引',
+      contexts: ['link'],
+    });
+
+    // 6. 【新增扩展功能】批量文件下载：探测当前页面下载资源并唤起侧边栏
+    createMenuItem({
+      id: 'dsh-batch-download-files',
+      title: '📦 批量下载本页文件到 DSH 研究目录',
       contexts: ['page'],
     });
   });
 }
 
+// 确保在 Service Worker 初始化、安装与浏览器启动时 100% 成功就绪
+setupContextMenus();
 chrome.runtime.onInstalled.addListener(setupContextMenus);
 if (chrome.runtime.onStartup) {
   chrome.runtime.onStartup.addListener(setupContextMenus);
@@ -225,17 +243,43 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   } else if (info.menuItemId === 'dsh-capture-image') {
     const pageUrl = tab.url || info.pageUrl || info.frameUrl || info.srcUrl || 'local://image-asset';
     const originalSrc = info.srcUrl || '';
+
+    let projectName = '';
+    let activeTopics = ['General'];
+    try {
+      const settings = await getSettings();
+      const project = await getActiveProject();
+      projectName = project.name;
+      activeTopics = (settings.activeTopics && settings.activeTopics.length > 0)
+        ? settings.activeTopics
+        : [settings.activeTopic || 'General'];
+    } catch (e) {
+      console.warn('获取项目配置失败，使用默认配置', e);
+    }
+
+    let blobDataUrl: string | undefined = undefined;
+    if (originalSrc.startsWith('http') || originalSrc.startsWith('data:')) {
+      try {
+        const fileData = await downloadFileFromUrl(originalSrc);
+        blobDataUrl = fileData.dataUrl;
+      } catch (e) {
+        console.warn('获取图片二进制数据失败，降级为远程链接记录', e);
+      }
+    }
+
     const item: CapturedItem = {
       id: `img-${Date.now()}`,
-      project: '',
-      topic: '',
+      project: projectName,
+      topic: activeTopics.join('+'),
+      topics: activeTopics,
       title: `图片素材: ${tab.title || '网页图片'}`,
       url: pageUrl,
+      urlType: resolveUrlType(pageUrl),
       sourcePlatform: 'web_article',
       capturedAt: new Date().toISOString(),
       documentType: 'media',
-      tags: ['Image', 'Asset'],
-      markdownContent: `![${tab.title || 'image'}](${originalSrc})\n\n> 🌐 **来源页面**: [${pageUrl}](${pageUrl})\n> 🖼️ **原图地址**: ${originalSrc || '未知'}\n> ⏰ **抓取时刻**: ${new Date().toLocaleString()}`,
+      tags: ['Image', 'Asset', ...activeTopics],
+      markdownContent: `![${tab.title || 'image'}](${originalSrc})\n\n> 🌐 **来源页面**: [${pageUrl}](${pageUrl})\n> 🖼️ **原图地址**: ${originalSrc || '未知'}\n> 🏷️ **归属主题**: ${activeTopics.join('、')}\n> ⏰ **抓取时刻**: ${new Date().toLocaleString()}`,
       mediaAttachments: [
         {
           id: `att-${Date.now()}`,
@@ -243,6 +287,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
           originalUrl: originalSrc,
           filename: `img_${Date.now()}.png`,
           localPath: `assets/img_${Date.now()}.png`,
+          blobDataUrl: blobDataUrl,
         },
       ],
     };
@@ -251,7 +296,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       const result = await executeSaveBundle(item);
       sendMessageWithAutoInject(tab.id, {
         type: 'SHOW_TOAST',
-        payload: { message: `图片已保存至 ${result.savedPath}` },
+        payload: { message: `✓ 图片素材已保存至当前项目空间！` },
       });
     } catch (err) {
       sendMessageWithAutoInject(tab.id, {
