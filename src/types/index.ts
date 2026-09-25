@@ -140,6 +140,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 
 export type MessageType = 
   | 'PING'
+  | 'PING_SIDEPANEL'
   | 'GET_PAGE_INFO'
   | 'CAPTURE_FULL_PAGE'
   | 'CAPTURE_SELECTION'

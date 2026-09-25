@@ -182,6 +182,11 @@ export default function App() {
     let handleRuntimeMsg: ((msg: any, sender: any, sendResponse: (res?: any) => void) => boolean | void) | null = null;
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
       handleRuntimeMsg = (msg: any, _sender: any, sendResponse: (res?: any) => void) => {
+        if (msg.type === 'PING_SIDEPANEL') {
+          sendResponse({ ok: true, activeProjectId: settings.activeProjectId });
+          return true;
+        }
+
         if (msg.type === 'EXECUTE_SAVE_IN_SIDEPANEL') {
           const item = msg.payload as CapturedItem;
           executeSaveBundle(item)
@@ -380,7 +385,11 @@ export default function App() {
       const res = await pickWorkspaceDirectory(activeProject.id);
       setFsHandleActive(true);
       setFsDirName(res.name);
-      await updateProject(activeProject.id, { workspacePath: res.name });
+      // 保持原有固定的 workspacePath 路径不被覆盖，仅更新存储模式为 fs_access
+      await updateProject(activeProject.id, { 
+        storageMode: 'fs_access',
+        ...(activeProject.workspacePath ? {} : { workspacePath: res.name })
+      });
       showToast(`已授权本地目录，落盘空间: ${res.name}/dshWebSensor 已就绪`);
       loadData();
     } catch (err) {

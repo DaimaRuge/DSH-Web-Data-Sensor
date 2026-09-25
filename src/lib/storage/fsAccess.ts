@@ -45,8 +45,9 @@ export async function pickWorkspaceDirectory(projectId: string): Promise<{ name:
 /**
  * 获取已保存的项目目录句柄并验证/请求读写权限。
  * 若当前项目尚未单独选取，自动尝试复用已授权的根句柄/最新句柄，实现项目无缝切换！
+ * 保证目录句柄固定稳定，严禁自动开辟同名子目录，确保数据直接保存于授权目录下的 dshWebSensor/
  */
-export async function getWorkspaceDirectoryHandle(projectId?: string, projectName?: string): Promise<FileSystemDirectoryHandle | null> {
+export async function getWorkspaceDirectoryHandle(projectId?: string, _projectName?: string): Promise<FileSystemDirectoryHandle | null> {
   let handle: FileSystemDirectoryHandle | null = null;
   if (projectId) {
     handle = await get<FileSystemDirectoryHandle>(`${DIR_HANDLE_PREFIX}${projectId}`) || null;
@@ -57,32 +58,7 @@ export async function getWorkspaceDirectoryHandle(projectId?: string, projectNam
     const rootHandle = await get<FileSystemDirectoryHandle>(`${DIR_HANDLE_PREFIX}root`) 
       || await get<FileSystemDirectoryHandle>(`${DIR_HANDLE_PREFIX}latest`);
     if (rootHandle) {
-      // 验证根句柄权限
-      try {
-        if (typeof (rootHandle as any).queryPermission === 'function') {
-          const queryRes = await (rootHandle as unknown as { queryPermission: (options: { mode: string }) => Promise<string> }).queryPermission({ mode: 'readwrite' });
-          if (queryRes === 'granted') {
-            if (projectName && projectName !== rootHandle.name && rootHandle.name !== 'dshWebSensor') {
-              try {
-                // 自动在根目录下为新项目开辟专属子目录
-                const projDir = await rootHandle.getDirectoryHandle(projectName, { create: true });
-                await ensureSensorDirectoryOnHandle(projDir);
-                if (projectId) await set(`${DIR_HANDLE_PREFIX}${projectId}`, projDir);
-                return projDir;
-              } catch {
-                handle = rootHandle;
-              }
-            } else {
-              handle = rootHandle;
-            }
-          }
-        } else {
-          handle = rootHandle;
-        }
-      } catch (err) {
-        console.warn('验证工作区根句柄权限失败', err);
-        handle = rootHandle;
-      }
+      handle = rootHandle;
     }
   }
 
@@ -126,8 +102,12 @@ export async function getWorkspaceDirectoryHandle(projectId?: string, projectNam
     console.warn('验证或请求目录句柄权限失败', err);
   }
 
-  // 只要句柄本身存在，在现代 Chromium 中仍可直接返回供上层尝试写入，不轻易阻断
-  return handle;
+  // 在有 Window 环境（如 Sidepanel）下直接返回句柄供写入尝试
+  if (typeof window !== 'undefined') {
+    return handle;
+  }
+  // 在 Service Worker 环境中，若未显式获得 granted 权限，返回 null 避免触发无权写入异常
+  return null;
 }
 
 /**

@@ -145,6 +145,82 @@ async function downloadFileFromUrl(url: string): Promise<{ dataUrl: string; size
   };
 }
 
+/**
+ * 核心落盘调度：智能路由 Track B (Bridge 直写) -> Track A (Sidepanel 窗口委托) -> 兜底直接执行
+ */
+async function handleSaveBundleDispatch(item: CapturedItem): Promise<SaveResult> {
+  const settings = await getSettings();
+
+  // 1. 优先检查本地 Bridge 伴侣服务 (Track B: 100% 免授权物理直写)
+  const bridgeHealth = await checkBridgeHealth(settings.bridgeUrl);
+  if (bridgeHealth && bridgeHealth.status === 'ok') {
+    return await executeSaveBundle(item);
+  }
+
+  // 2. 检查 Sidepanel 前台授权窗口是否在线 (Track A: 拥有活跃 DOM / FileSystem 权限)
+  const isSidepanelOpen = await new Promise<boolean>((resolve) => {
+    let responded = false;
+    const timer = setTimeout(() => {
+      if (!responded) {
+        responded = true;
+        resolve(false);
+      }
+    }, 250); // 250ms 快速探活
+
+    chrome.runtime.sendMessage({ type: 'PING_SIDEPANEL' }, (res) => {
+      if (!responded) {
+        responded = true;
+        clearTimeout(timer);
+        if (!chrome.runtime.lastError && res && res.ok) {
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      }
+    });
+  });
+
+  if (isSidepanelOpen) {
+    try {
+      const sidepanelResult = await new Promise<SaveResult>((resolve, reject) => {
+        let isDone = false;
+        const timer = setTimeout(() => {
+          if (!isDone) {
+            isDone = true;
+            reject(new Error('前台侧边栏落盘响应超时 (30s)'));
+          }
+        }, 30000); // 30s 宽裕超时，兼容大文件与 AI 分析
+
+        chrome.runtime.sendMessage(
+          { type: 'EXECUTE_SAVE_IN_SIDEPANEL', payload: item },
+          (res) => {
+            if (!isDone) {
+              isDone = true;
+              clearTimeout(timer);
+              if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+              } else if (res && res.success && res.data) {
+                resolve(res.data);
+              } else {
+                reject(new Error(res?.error || '侧边栏写入失败'));
+              }
+            }
+          }
+        );
+      });
+
+      if (sidepanelResult) {
+        return sidepanelResult;
+      }
+    } catch (err) {
+      console.warn('委托 Sidepanel 前台落盘异常，尝试备选管道:', err);
+    }
+  }
+
+  // 3. 若 Sidepanel 离线且 Bridge 离线：直接在后台调用 executeSaveBundle
+  return await executeSaveBundle(item);
+}
+
 // 处理右键菜单点击
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
@@ -211,7 +287,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         ],
       };
 
-      const result = await executeSaveBundle(item);
+      const result = await handleSaveBundleDispatch(item);
       sendMessageWithAutoInject(tab.id, {
         type: 'SHOW_TOAST',
         payload: { message: `✓ 文件【${filename}】(${sizeStr}) 已存入 DSH 研究目录并完成索引！` },
@@ -294,7 +370,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     };
 
     try {
-      const result = await executeSaveBundle(item);
+      const result = await handleSaveBundleDispatch(item);
       sendMessageWithAutoInject(tab.id, {
         type: 'SHOW_TOAST',
         payload: { message: `✓ 图片素材已保存至当前项目空间！` },
@@ -357,53 +433,6 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
     }
     return true;
   }
-
-async function handleSaveBundleDispatch(item: CapturedItem): Promise<SaveResult> {
-  const settings = await getSettings();
-
-  // 1. 优先检查本地 Bridge 伴侣服务 (Track B: 100% 免授权物理直写)
-  const bridgeHealth = await checkBridgeHealth(settings.bridgeUrl);
-  if (bridgeHealth && bridgeHealth.status === 'ok') {
-    return await executeSaveBundle(item);
-  }
-
-  // 2. 若 Sidepanel 前台授权窗口开启，委托给 Sidepanel Window 上下文落盘 (拥有活跃 DOM / FileSystem 权限)
-  try {
-    const sidepanelResult = await new Promise<SaveResult | null>((resolve) => {
-      let isDone = false;
-      const timer = setTimeout(() => {
-        if (!isDone) {
-          isDone = true;
-          resolve(null);
-        }
-      }, 1000);
-
-      chrome.runtime.sendMessage(
-        { type: 'EXECUTE_SAVE_IN_SIDEPANEL', payload: item },
-        (res) => {
-          if (!isDone) {
-            isDone = true;
-            clearTimeout(timer);
-            if (!chrome.runtime.lastError && res && res.success && res.data) {
-              resolve(res.data);
-            } else {
-              resolve(null);
-            }
-          }
-        }
-      );
-    });
-
-    if (sidepanelResult) {
-      return sidepanelResult;
-    }
-  } catch (err) {
-    console.warn('委托 Sidepanel 前台落盘未响应，进入备选管道', err);
-  }
-
-  // 3. 后台直接执行 executeSaveBundle (尝试 FS Access 或 Downloads 兜底)
-  return await executeSaveBundle(item);
-}
 
   if (message.type === 'SAVE_BUNDLE') {
     const item = message.payload as CapturedItem;

@@ -155,7 +155,10 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
     try {
       const fsRes = await saveBundleViaFsAccess(dirHandle, item);
       item.status = 'saved';
-      item.savedPath = `${project.workspacePath || dirHandle.name}/${fsRes.targetPath}`;
+      const basePath = (project.workspacePath && !project.workspacePath.includes('default-project'))
+        ? project.workspacePath.replace(/\\/g, '/').replace(/\/$/, '')
+        : dirHandle.name;
+      item.savedPath = `${basePath}/${fsRes.targetPath}`;
       await addRecentCapture(item);
       notifySaved(item);
       trackEvent({
@@ -180,11 +183,11 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
         item,
       };
     } catch (err) {
-      console.warn('File System Access API 写入重试/失败，准备尝试备选通道:', err);
+      console.warn('File System Access API 写入尝试未通过:', err);
     }
   }
 
-  // 4. 备选通道：通过 Chrome Downloads API 自动落盘至 Downloads/DSH_WebSensor/
+  // 4. 备选通道：仅在明确无本地授权目录或桥接时，通过 Chrome Downloads API 自动落盘至 Downloads/DSH_WebSensor/
   if (typeof chrome !== 'undefined' && chrome.downloads && chrome.downloads.download) {
     try {
       const safeProject = (project.name || 'default').replace(/[\\/:*?"<>|\s]/g, '_');
@@ -193,8 +196,9 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
       const slug = (item.title || 'untitled').slice(0, 25).trim().replace(/[\\/:*?"<>|\s]+/g, '_');
       const folder = `DSH_WebSensor/${safeProject}/${safeTopic}/${dateStr}_${slug}_${item.id.slice(-6)}`;
 
-      // 4.1 下载 content.md (使用 Data URL 避免在 Service Worker 中调用 URL.createObjectURL 报错)
-      const mdUrl = textToDataUrl(item.markdownContent, 'text/markdown;charset=utf-8');
+      // 4.1 下载 content.md
+      const safeMd = item.markdownContent || '';
+      const mdUrl = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(safeMd);
       chrome.downloads.download({
         url: mdUrl,
         filename: `${folder}/content.md`,
@@ -227,7 +231,7 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
           local_path: m.localPath,
         })),
       };
-      const metaUrl = textToDataUrl(JSON.stringify(metaObj, null, 2), 'application/json;charset=utf-8');
+      const metaUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(metaObj, null, 2));
       chrome.downloads.download({
         url: metaUrl,
         filename: `${folder}/metadata.json`,

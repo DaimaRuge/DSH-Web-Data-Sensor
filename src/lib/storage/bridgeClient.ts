@@ -13,24 +13,35 @@ export interface BridgeSaveResponse {
   message?: string;
 }
 
+let lastHealthCheckTime = 0;
+let lastHealthCheckResult: BridgeHealthResponse | null = null;
+
 /**
- * 检测本地 DSH Bridge 服务是否在线
+ * 检测本地 DSH Bridge 服务是否在线（内置 2 秒高速缓存，避免频繁阻塞）
  */
-export async function checkBridgeHealth(bridgeUrl = 'http://127.0.0.1:8765'): Promise<BridgeHealthResponse | null> {
+export async function checkBridgeHealth(bridgeUrl = 'http://127.0.0.1:8765', force = false): Promise<BridgeHealthResponse | null> {
+  const now = Date.now();
+  if (!force && now - lastHealthCheckTime < 2000 && lastHealthCheckResult !== null) {
+    return lastHealthCheckResult;
+  }
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 1500); // 1.5s 快速心跳超时
+    const timeoutId = setTimeout(() => controller.abort(), 600); // 600ms 本地心跳快速超时
     const res = await fetch(`${bridgeUrl.replace(/\/$/, '')}/api/health`, {
       method: 'GET',
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
     if (res.ok) {
-      return await res.json();
+      lastHealthCheckResult = await res.json();
+      lastHealthCheckTime = now;
+      return lastHealthCheckResult;
     }
   } catch {
     // 服务未启动或离线
   }
+  lastHealthCheckResult = null;
+  lastHealthCheckTime = now;
   return null;
 }
 
