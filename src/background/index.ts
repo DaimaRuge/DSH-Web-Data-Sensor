@@ -1,4 +1,5 @@
-import { executeSaveBundle } from '@/lib/storage/bundleSaver';
+import { executeSaveBundle, SaveResult } from '@/lib/storage/bundleSaver';
+import { checkBridgeHealth } from '@/lib/storage/bridgeClient';
 import { getSettings, getActiveProject } from '@/lib/storage/settings';
 import { CapturedItem, ExtensionMessage, resolveUrlType } from '@/types';
 import { deriveFilename } from '@/lib/parser/fileDetector';
@@ -357,9 +358,56 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
     return true;
   }
 
+async function handleSaveBundleDispatch(item: CapturedItem): Promise<SaveResult> {
+  const settings = await getSettings();
+
+  // 1. 优先检查本地 Bridge 伴侣服务 (Track B: 100% 免授权物理直写)
+  const bridgeHealth = await checkBridgeHealth(settings.bridgeUrl);
+  if (bridgeHealth && bridgeHealth.status === 'ok') {
+    return await executeSaveBundle(item);
+  }
+
+  // 2. 若 Sidepanel 前台授权窗口开启，委托给 Sidepanel Window 上下文落盘 (拥有活跃 DOM / FileSystem 权限)
+  try {
+    const sidepanelResult = await new Promise<SaveResult | null>((resolve) => {
+      let isDone = false;
+      const timer = setTimeout(() => {
+        if (!isDone) {
+          isDone = true;
+          resolve(null);
+        }
+      }, 1000);
+
+      chrome.runtime.sendMessage(
+        { type: 'EXECUTE_SAVE_IN_SIDEPANEL', payload: item },
+        (res) => {
+          if (!isDone) {
+            isDone = true;
+            clearTimeout(timer);
+            if (!chrome.runtime.lastError && res && res.success && res.data) {
+              resolve(res.data);
+            } else {
+              resolve(null);
+            }
+          }
+        }
+      );
+    });
+
+    if (sidepanelResult) {
+      return sidepanelResult;
+    }
+  } catch (err) {
+    console.warn('委托 Sidepanel 前台落盘未响应，进入备选管道', err);
+  }
+
+  // 3. 后台直接执行 executeSaveBundle (尝试 FS Access 或 Downloads 兜底)
+  return await executeSaveBundle(item);
+}
+
   if (message.type === 'SAVE_BUNDLE') {
     const item = message.payload as CapturedItem;
-    executeSaveBundle(item)
+    handleSaveBundleDispatch(item)
       .then(res => {
         sendResponse({ success: true, data: res });
       })

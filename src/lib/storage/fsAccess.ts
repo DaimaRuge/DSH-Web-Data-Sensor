@@ -1,12 +1,15 @@
-import { get, set, del } from 'idb-keyval';
+import { get, set, del, keys } from 'idb-keyval';
 import { CapturedItem, resolveUrlType } from '@/types';
 
 const DIR_HANDLE_PREFIX = 'dsh_fs_dir_handle_';
 
 /**
- * 确保给定目录句柄下物理存在 dshWebSensor 子目录
+ * 确保给定目录句柄下物理存在 dshWebSensor 子目录（若所选目录自身即为 dshWebSensor 则直接复用）
  */
 export async function ensureSensorDirectoryOnHandle(handle: FileSystemDirectoryHandle): Promise<FileSystemDirectoryHandle> {
+  if (handle.name === 'dshWebSensor') {
+    return handle;
+  }
   return await handle.getDirectoryHandle('dshWebSensor', { create: true });
 }
 
@@ -24,9 +27,9 @@ export async function pickWorkspaceDirectory(projectId: string): Promise<{ name:
     mode: 'readwrite',
   });
 
-  // 自动建议并立即物理创建 dshWebSensor 子目录
+  // 自动建议并立即物理创建 dshWebSensor 子目录（自身即为 dshWebSensor 时无需嵌套）
   try {
-    await handle.getDirectoryHandle('dshWebSensor', { create: true });
+    await ensureSensorDirectoryOnHandle(handle);
   } catch (err) {
     console.warn('自动在授权目录中创建 dshWebSensor 失败:', err);
   }
@@ -41,10 +44,13 @@ export async function pickWorkspaceDirectory(projectId: string): Promise<{ name:
 
 /**
  * 获取已保存的项目目录句柄并验证/请求读写权限。
- * 若当前项目尚未单独选取，自动尝试复用已授权的工作区根句柄或为其创建子目录，实现项目无缝切换！
+ * 若当前项目尚未单独选取，自动尝试复用已授权的根句柄/最新句柄，实现项目无缝切换！
  */
-export async function getWorkspaceDirectoryHandle(projectId: string, projectName?: string): Promise<FileSystemDirectoryHandle | null> {
-  let handle = await get<FileSystemDirectoryHandle>(`${DIR_HANDLE_PREFIX}${projectId}`);
+export async function getWorkspaceDirectoryHandle(projectId?: string, projectName?: string): Promise<FileSystemDirectoryHandle | null> {
+  let handle: FileSystemDirectoryHandle | null = null;
+  if (projectId) {
+    handle = await get<FileSystemDirectoryHandle>(`${DIR_HANDLE_PREFIX}${projectId}`) || null;
+  }
 
   // 若当前项目无独立句柄，尝试复用已授权的根句柄/最新句柄
   if (!handle) {
@@ -53,25 +59,43 @@ export async function getWorkspaceDirectoryHandle(projectId: string, projectName
     if (rootHandle) {
       // 验证根句柄权限
       try {
-        const queryRes = await (rootHandle as unknown as { queryPermission: (options: { mode: string }) => Promise<string> }).queryPermission({ mode: 'readwrite' });
-        if (queryRes === 'granted') {
-          if (projectName && projectName !== rootHandle.name) {
-            try {
-              // 自动在根目录下为新项目开辟专属子目录
-              const projDir = await rootHandle.getDirectoryHandle(projectName, { create: true });
-              await projDir.getDirectoryHandle('dshWebSensor', { create: true });
-              await set(`${DIR_HANDLE_PREFIX}${projectId}`, projDir);
-              return projDir;
-            } catch {
+        if (typeof (rootHandle as any).queryPermission === 'function') {
+          const queryRes = await (rootHandle as unknown as { queryPermission: (options: { mode: string }) => Promise<string> }).queryPermission({ mode: 'readwrite' });
+          if (queryRes === 'granted') {
+            if (projectName && projectName !== rootHandle.name && rootHandle.name !== 'dshWebSensor') {
+              try {
+                // 自动在根目录下为新项目开辟专属子目录
+                const projDir = await rootHandle.getDirectoryHandle(projectName, { create: true });
+                await ensureSensorDirectoryOnHandle(projDir);
+                if (projectId) await set(`${DIR_HANDLE_PREFIX}${projectId}`, projDir);
+                return projDir;
+              } catch {
+                handle = rootHandle;
+              }
+            } else {
               handle = rootHandle;
             }
-          } else {
-            handle = rootHandle;
           }
+        } else {
+          handle = rootHandle;
         }
       } catch (err) {
         console.warn('验证工作区根句柄权限失败', err);
+        handle = rootHandle;
       }
+    }
+  }
+
+  // 全量 IndexedDB 缓存兜底：若仍未找到，查找任意已存在的有效授权句柄
+  if (!handle) {
+    try {
+      const allKeys = await keys();
+      const matchedKey = allKeys.find(k => typeof k === 'string' && k.startsWith(DIR_HANDLE_PREFIX));
+      if (matchedKey) {
+        handle = await get<FileSystemDirectoryHandle>(matchedKey as string) || null;
+      }
+    } catch (e) {
+      console.warn('全量查找目录句柄缓存异常', e);
     }
   }
 
@@ -79,20 +103,31 @@ export async function getWorkspaceDirectoryHandle(projectId: string, projectName
 
   // 校验权限并确保 dshWebSensor 存在
   try {
-    const queryResult = await (handle as unknown as { queryPermission: (options: { mode: string }) => Promise<string> }).queryPermission({ mode: 'readwrite' });
-    if (queryResult === 'granted') {
-      await ensureSensorDirectoryOnHandle(handle).catch(() => {});
-      return handle;
+    if (typeof (handle as any).queryPermission === 'function') {
+      const queryResult = await (handle as unknown as { queryPermission: (options: { mode: string }) => Promise<string> }).queryPermission({ mode: 'readwrite' });
+      if (queryResult === 'granted') {
+        await ensureSensorDirectoryOnHandle(handle).catch(() => {});
+        return handle;
+      }
     }
-    const requestResult = await (handle as unknown as { requestPermission: (options: { mode: string }) => Promise<string> }).requestPermission({ mode: 'readwrite' });
-    if (requestResult === 'granted') {
-      await ensureSensorDirectoryOnHandle(handle).catch(() => {});
-      return handle;
+    // 仅在有 Window 且非 Service Worker 环境下尝试 requestPermission
+    if (typeof window !== 'undefined' && typeof (handle as any).requestPermission === 'function') {
+      try {
+        const requestResult = await (handle as unknown as { requestPermission: (options: { mode: string }) => Promise<string> }).requestPermission({ mode: 'readwrite' });
+        if (requestResult === 'granted') {
+          await ensureSensorDirectoryOnHandle(handle).catch(() => {});
+          return handle;
+        }
+      } catch (reqErr) {
+        console.warn('跳过 requestPermission (缺少直接用户手势):', reqErr);
+      }
     }
   } catch (err) {
     console.warn('验证或请求目录句柄权限失败', err);
   }
-  return null;
+
+  // 只要句柄本身存在，在现代 Chromium 中仍可直接返回供上层尝试写入，不轻易阻断
+  return handle;
 }
 
 /**
@@ -119,8 +154,13 @@ export async function saveBundleViaFsAccess(
     .replace(/[\\/:*?"<>|\s]+/g, '_');
   const bundleFolderName = `${dateStr}_${slug}_${item.id.slice(-6)}`;
 
-  // 1. 自动切换或创建项目空间根目录下的 dshWebSensor 子目录
-  const sensorDir = await handle.getDirectoryHandle('dshWebSensor', { create: true });
+  // 1. 自动切换或创建项目空间根目录下的 dshWebSensor 子目录（若所选目录自身即为 dshWebSensor 则直接复用）
+  let sensorDir: FileSystemDirectoryHandle;
+  if (handle.name === 'dshWebSensor') {
+    sensorDir = handle;
+  } else {
+    sensorDir = await handle.getDirectoryHandle('dshWebSensor', { create: true });
+  }
 
   // 2. 在 dshWebSensor 下获取或创建 Topic 目录
   const topicDir = await sensorDir.getDirectoryHandle(safeTopic, { create: true });
@@ -152,7 +192,7 @@ export async function saveBundleViaFsAccess(
     ai_metadata: item.aiMetadata || {},
     is_screenshot: item.documentType === 'screenshot',
     screenshot_metadata: item.screenshotMetadata || null,
-    media_attachments: item.mediaAttachments.map(m => ({
+    media_attachments: (item.mediaAttachments || []).map(m => ({
       id: m.id,
       type: m.type,
       original_url: m.originalUrl,

@@ -178,10 +178,26 @@ export default function App() {
       chrome.tabs.onUpdated?.addListener(onTabUpdated);
     }
 
-    // 监听实时线索落盘通知（如截图快照完成或抓取保存）
-    let handleRuntimeMsg: ((msg: any) => void) | null = null;
+    // 监听实时线索落盘通知（如截图快照完成或抓取保存）与前台落盘委托
+    let handleRuntimeMsg: ((msg: any, sender: any, sendResponse: (res?: any) => void) => boolean | void) | null = null;
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
-      handleRuntimeMsg = (msg: any) => {
+      handleRuntimeMsg = (msg: any, _sender: any, sendResponse: (res?: any) => void) => {
+        if (msg.type === 'EXECUTE_SAVE_IN_SIDEPANEL') {
+          const item = msg.payload as CapturedItem;
+          executeSaveBundle(item)
+            .then(res => {
+              sendResponse({ success: true, data: res });
+              loadData();
+              if (item.title) {
+                showToast(`✓ 已成功存入本地目录: ${item.title.slice(0, 20)}`);
+              }
+            })
+            .catch(err => {
+              sendResponse({ success: false, error: (err as Error).message });
+            });
+          return true; // 异步响应
+        }
+
         if (msg.type === 'ITEM_SAVED_EVENT') {
           loadData();
           if (msg.payload?.title) {

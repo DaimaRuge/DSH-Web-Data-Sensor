@@ -35,12 +35,25 @@ export interface SaveResult {
   item: CapturedItem;
 }
 
+function textToDataUrl(text: string, mimeType: string = 'text/plain;charset=utf-8'): string {
+  const utf8Bytes = new TextEncoder().encode(text);
+  let binary = '';
+  const len = utf8Bytes.byteLength;
+  const chunkSize = 0x8000;
+  for (let i = 0; i < len; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, Array.from(utf8Bytes.subarray(i, Math.min(i + chunkSize, len))));
+  }
+  return `data:${mimeType};base64,${btoa(binary)}`;
+}
+
 /**
  * 核心统一落盘管道：智能路由 Track A (FS Access) 与 Track B (Local Bridge)
  */
 export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveResult> {
   const settings = await getSettings();
-  const project = await getActiveProject();
+  // 查找匹配 itemToSave.project 的项目，或使用当前活跃项目
+  const project = (itemToSave.project && settings.projects.find(p => p.id === itemToSave.project || p.name === itemToSave.project))
+    || await getActiveProject();
 
   const activeTopics = (itemToSave.topics && itemToSave.topics.length > 0)
     ? itemToSave.topics
@@ -137,7 +150,7 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
   }
 
   // 3. 检查轨 A：File System Access API 授权目录
-  const dirHandle = await getWorkspaceDirectoryHandle(project.id);
+  const dirHandle = await getWorkspaceDirectoryHandle(project.id, project.name);
   if (dirHandle) {
     try {
       const fsRes = await saveBundleViaFsAccess(dirHandle, item);
@@ -167,8 +180,7 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
         item,
       };
     } catch (err) {
-      console.error('File System Access API 落盘失败:', err);
-      throw new Error(`写入本地磁盘失败，请检查文件夹权限: ${(err as Error).message}`);
+      console.warn('File System Access API 写入重试/失败，准备尝试备选通道:', err);
     }
   }
 
@@ -181,9 +193,8 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
       const slug = (item.title || 'untitled').slice(0, 25).trim().replace(/[\\/:*?"<>|\s]+/g, '_');
       const folder = `DSH_WebSensor/${safeProject}/${safeTopic}/${dateStr}_${slug}_${item.id.slice(-6)}`;
 
-      // 4.1 下载 content.md
-      const mdBlob = new Blob([item.markdownContent], { type: 'text/markdown;charset=utf-8' });
-      const mdUrl = URL.createObjectURL(mdBlob);
+      // 4.1 下载 content.md (使用 Data URL 避免在 Service Worker 中调用 URL.createObjectURL 报错)
+      const mdUrl = textToDataUrl(item.markdownContent, 'text/markdown;charset=utf-8');
       chrome.downloads.download({
         url: mdUrl,
         filename: `${folder}/content.md`,
@@ -216,8 +227,7 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
           local_path: m.localPath,
         })),
       };
-      const metaBlob = new Blob([JSON.stringify(metaObj, null, 2)], { type: 'application/json;charset=utf-8' });
-      const metaUrl = URL.createObjectURL(metaBlob);
+      const metaUrl = textToDataUrl(JSON.stringify(metaObj, null, 2), 'application/json;charset=utf-8');
       chrome.downloads.download({
         url: metaUrl,
         filename: `${folder}/metadata.json`,
@@ -244,7 +254,7 @@ export async function executeSaveBundle(itemToSave: CapturedItem): Promise<SaveR
         success: true,
         mode: 'downloads',
         savedPath: item.savedPath,
-        message: '已通过 Chrome 下载通道写入本地 Downloads/DSH_WebSensor 目录',
+        message: '已通过 Chrome 下载通道安全写入本地 Downloads/DSH_WebSensor 目录',
         item,
       };
     } catch (dErr) {
